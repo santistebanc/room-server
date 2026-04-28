@@ -32,7 +32,7 @@ export default class RoomServer implements Party.Server {
   private maxConnections = 100;
   private connectionCount = 0;
 
-  constructor(private party: Party.Party) {}
+  constructor(private party: Party.Room) {}
 
   // ── Lifecycle ───────────────────────────────────────────────────────────────
 
@@ -58,10 +58,14 @@ export default class RoomServer implements Party.Server {
       // Restore connection count and prune presence keys left by a hard crash.
       // On hibernation wakeup, live connections are preserved and their presence
       // keys are valid. On crash, connections drop and old presence keys are orphaned.
-      const liveIds = new Set(
-        [...this.party.getConnections()].map((c) => c.id)
-      );
-      this.connectionCount = liveIds.size;
+      const liveConnections = [...this.party.getConnections()];
+      this.connectionCount = liveConnections.length;
+      // Populate subscriptions so re-subscribe messages and onClose work correctly
+      // after hibernation wakeup (onConnect is not re-fired for existing connections).
+      for (const conn of liveConnections) {
+        this.subscriptions.set(conn.id, new Set());
+      }
+      const liveIds = new Set(liveConnections.map((c) => c.id));
 
       let presenceCursor: string | undefined;
       do {
@@ -197,7 +201,7 @@ export default class RoomServer implements Party.Server {
     const recurring = await dos.get<{ interval: number; action: AlarmAction; nextAt: number }>(
       `${META}alarm/recurring`
     );
-    if (recurring && recurring.nextAt <= now) {
+    if (recurring && (recurring.nextAt ?? 0) <= now) {
       try { await this.executeAction(recurring.action); } catch {}
       await dos.put(`${META}alarm/recurring`, {
         ...recurring,
