@@ -16,8 +16,24 @@ jobs:
 
       - run: npm ci
 
+      - name: Check if PARTYKIT_TOKEN is set
+        run: |
+          if [ -z "$PARTYKIT_TOKEN" ]; then
+            echo "ERROR: PARTYKIT_TOKEN is not set"
+            exit 1
+          else
+            echo "PARTYKIT_TOKEN is set (length: ${#PARTYKIT_TOKEN})"
+          fi
+        env:
+          PARTYKIT_TOKEN: ${{ secrets.PARTYKIT_TOKEN }}
+
       - name: Verify PartyKit authentication
         run: npx partykit whoami
+        env:
+          PARTYKIT_TOKEN: ${{ secrets.PARTYKIT_TOKEN }}
+
+      - name: Login to PartyKit (if needed)
+        run: echo "$PARTYKIT_TOKEN" | npx partykit login --token-stdin
         env:
           PARTYKIT_TOKEN: ${{ secrets.PARTYKIT_TOKEN }}
 
