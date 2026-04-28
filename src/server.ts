@@ -330,7 +330,7 @@ export default class RoomServer implements Party.Server {
           send(conn, { op: "result", requestId: msg.requestId, key: msg.key, value: null });
           break;
         }
-        const value = await this.getWithTTLCheck(msg.key);
+        const value = await this.getWithTTLCheck(msg.key, conn.id);
         send(conn, { op: "result", requestId: msg.requestId, key: msg.key, value });
         break;
       }
@@ -364,7 +364,7 @@ export default class RoomServer implements Party.Server {
           send(conn, { op: "error", requestId: msg.requestId, message: "Reserved key prefix" });
           break;
         }
-        const current = await this.getWithTTLCheck(msg.key);
+        const current = await this.getWithTTLCheck(msg.key, conn.id);
         const num = typeof current === "number" ? current : 0;
         const next = num + (msg.delta ?? 1);
         await this.store.set(msg.key, next);
@@ -378,7 +378,7 @@ export default class RoomServer implements Party.Server {
           send(conn, { op: "error", requestId: msg.requestId, message: "Reserved key prefix" });
           break;
         }
-        const current = await this.getWithTTLCheck(msg.key);
+        const current = await this.getWithTTLCheck(msg.key, conn.id);
         const match = deepEqual(current, msg.ifValue);
         if (match) {
           await this.store.set(msg.key, msg.value);
@@ -507,16 +507,25 @@ export default class RoomServer implements Party.Server {
     let nextCursor: string | undefined;
     let fetchCursor = cursor;
 
-    for (let i = 0; i < 5; i++) {
+    // META_SKIP is the first key lexicographically past all "__rs/" entries.
+    // "/" is char 47; char 48 is "0". Used to jump the cursor in one step
+    // rather than paging through potentially hundreds of internal keys.
+    const META_SKIP = META.slice(0, -1) + String.fromCharCode(META.charCodeAt(META.length - 1) + 1);
+
+    for (let i = 0; i < 20; i++) {
       const page = await this.store.list(prefix, limit, fetchCursor);
+      let pageHadUserKeys = false;
       for (const [k, v] of Object.entries(page.entries)) {
-        if (!k.startsWith(META)) entries[k] = v;
+        if (!k.startsWith(META)) { entries[k] = v; pageHadUserKeys = true; }
       }
       nextCursor = page.nextCursor;
       const userCount = Object.keys(entries).length;
-      // Stop when we have no more pages, or have met the requested limit.
       if (!nextCursor || (limit !== undefined && userCount >= limit)) break;
-      fetchCursor = nextCursor;
+      // If the whole page was internal keys, jump past the internal namespace
+      // in one step instead of paging through every internal entry.
+      fetchCursor = (!pageHadUserKeys && nextCursor.startsWith(META))
+        ? META_SKIP
+        : nextCursor;
     }
 
     // Trim if a page boundary caused overshoot beyond limit.
@@ -578,13 +587,13 @@ export default class RoomServer implements Party.Server {
     }
   }
 
-  private async getWithTTLCheck(key: string): Promise<unknown> {
+  private async getWithTTLCheck(key: string, sourceConnId = ""): Promise<unknown> {
     const dos = this.party.storage as unknown as DurableObjectStorage;
     const expiresAt = await dos.get<number>(`${META}ttl/${key}`);
     if (expiresAt !== undefined && expiresAt <= Date.now()) {
       await this.store.delete(key);
       await dos.delete(`${META}ttl/${key}`);
-      this.notifySubscribers(key, null, "", true);
+      this.notifySubscribers(key, null, sourceConnId, true);
       return null;
     }
     return this.store.get(key);
