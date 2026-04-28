@@ -270,10 +270,12 @@ export default class RoomServer implements Party.Server {
 
       if (req.method === "POST") {
         const body = (await req.json()) as {
-          key: string;
+          key: unknown;
           value: unknown;
           ttl?: number;
         };
+        if (typeof body.key !== "string" || !body.key)
+          return cors(new Response("Missing or invalid key", { status: 400 }));
         if (body.key.startsWith(META) || body.key.startsWith("presence/"))
           return cors(new Response("Reserved key prefix", { status: 400 }));
         await this.store.set(body.key, body.value);
@@ -559,8 +561,8 @@ export default class RoomServer implements Party.Server {
     // Clamp to at least now+1 so delay=0 alarms are always scheduled.
     if (fireAt) pick(Math.max(fireAt, now + 1));
 
-    const rec = await dos.get<{ nextAt: number }>(`${META}alarm/recurring`);
-    if (rec) pick(Math.max(rec.nextAt, now + 1));
+    const rec = await dos.get<{ nextAt?: number }>(`${META}alarm/recurring`);
+    if (rec) pick(Math.max(rec.nextAt ?? 0, now + 1));
 
     if (next !== null) await dos.setAlarm(next);
     else await dos.deleteAlarm();
