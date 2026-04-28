@@ -1,0 +1,9 @@
+{
+  "$schema": "https://www.partykit.io/schema.json",
+  "name": "room-server",
+  "main": "src/server.ts",
+  "compatibilityDate": "2026-04-28",
+  "parties": {
+    "room": "src/server.ts"
+  }
+}

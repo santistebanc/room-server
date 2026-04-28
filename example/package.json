@@ -1,0 +1,17 @@
+{
+  "name": "room-server-example",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "partysocket": "^1.1.18"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3",
+    "vite": "^6.3.3"
+  }
+}

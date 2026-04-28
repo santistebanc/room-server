@@ -1,0 +1,35 @@
+{
+  "name": "room-server",
+  "version": "1.0.0",
+  "description": "Generic PartyKit backend — real-time KV, subscriptions, presence, and broadcast for any app.",
+  "main": "dist/server.js",
+  "types": "dist/server.d.ts",
+  "exports": {
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "default": "./dist/client.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "default": "./dist/types.js"
+    }
+  },
+  "scripts": {
+    "login": "partykit login",
+    "build": "tsc",
+    "dev": "partykit dev",
+    "deploy": "partykit deploy"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "partykit": "^0.0.115",
+    "partysocket": "^1.1.18"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260426.1",
+    "typescript": "^6.0.3"
+  }
+}

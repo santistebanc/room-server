@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>room-server demo</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f0f11;
+      --surface: #18181b;
+      --border: #27272a;
+      --accent: #6366f1;
+      --accent-dim: #4338ca;
+      --text: #e4e4e7;
+      --muted: #71717a;
+      --green: #22c55e;
+      --red: #ef4444;
+      --radius: 8px;
+      --font: "Inter", system-ui, sans-serif;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 14px;
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── Top bar ── */
+    header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    header h1 { font-size: 15px; font-weight: 600; letter-spacing: -0.3px; }
+
+    .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--red);
+      transition: background 0.3s;
+    }
+    .dot.connected { background: var(--green); }
+
+    .status-text { color: var(--muted); font-size: 12px; }
+
+    /* ── Connect panel ── */
+    #connect-panel {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .connect-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 32px;
+      width: 380px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .connect-card h2 { font-size: 16px; font-weight: 600; }
+    .connect-card p { color: var(--muted); font-size: 13px; line-height: 1.5; }
+
+    label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 4px; }
+
+    input, select {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 8px 10px;
+      color: var(--text);
+      font-size: 13px;
+      outline: none;
+    }
+    input:focus, select:focus { border-color: var(--accent); }
+
+    button {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: var(--radius);
+      padding: 9px 16px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    button:hover { background: var(--accent-dim); }
+    button.secondary {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+    button.secondary:hover { border-color: var(--accent); }
+    button.danger { background: var(--red); }
+    button.danger:hover { background: #dc2626; }
+
+    /* ── Main app layout ── */
+    #app {
+      display: none;
+      flex: 1;
+      min-height: 0;
+      gap: 1px;
+      background: var(--border);
+    }
+    #app.visible { display: flex; }
+
+    .panel {
+      background: var(--bg);
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+
+    .panel-header {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+
+    /* ── KV panel (left) ── */
+    #kv-panel { flex: 1; }
+
+    #kv-form {
+      display: flex;
+      gap: 8px;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    #kv-form input { flex: 1; }
+    #kv-form input:first-child { flex: 0 0 140px; }
+
+    #kv-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .kv-entry {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 10px 12px;
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      animation: fadeIn 0.2s ease;
+    }
+    .kv-entry.changed { border-color: var(--accent); }
+    .kv-key {
+      color: var(--accent);
+      font-family: monospace;
+      font-size: 12px;
+      min-width: 120px;
+      word-break: break-all;
+    }
+    .kv-value {
+      flex: 1;
+      font-family: monospace;
+      font-size: 12px;
+      color: var(--text);
+      word-break: break-all;
+    }
+    .kv-del {
+      background: none;
+      border: none;
+      color: var(--muted);
+      padding: 0;
+      cursor: pointer;
+      font-size: 16px;
+      line-height: 1;
+      flex-shrink: 0;
+    }
+    .kv-del:hover { color: var(--red); background: none; }
+
+    .empty-state {
+      color: var(--muted);
+      text-align: center;
+      padding: 40px 16px;
+      font-size: 13px;
+    }
+
+    /* ── Chat panel (right) ── */
+    #chat-panel { width: 300px; flex-shrink: 0; }
+
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .msg {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      animation: fadeIn 0.2s ease;
+    }
+    .msg-meta { font-size: 11px; color: var(--muted); }
+    .msg-body {
+      background: var(--surface);
+      border-radius: var(--radius);
+      padding: 8px 10px;
+      font-size: 13px;
+      line-height: 1.4;
+      border: 1px solid var(--border);
+    }
+    .msg.self .msg-body {
+      background: var(--accent-dim);
+      border-color: var(--accent);
+    }
+
+    #chat-form {
+      display: flex;
+      gap: 8px;
+      padding: 12px;
+      border-top: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    #chat-form input { flex: 1; }
+    #chat-form button { flex-shrink: 0; padding: 8px 12px; }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(4px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="dot" id="dot"></div>
+  <h1>room-server demo</h1>
+  <span class="status-text" id="status-text">disconnected</span>
+  <button class="secondary" id="disconnect-btn" style="margin-left:auto;display:none">Disconnect</button>
+</header>
+
+<!-- Connect panel -->
+<div id="connect-panel">
+  <div class="connect-card">
+    <h2>Connect to a room</h2>
+    <p>Enter your PartyKit host, API key, room, and persistence level. Any client with the same config shares real-time state.</p>
+
+    <div>
+      <label>PartyKit host</label>
+      <input id="inp-host" value="localhost:1999" placeholder="your-project.partykit.dev" />
+    </div>
+    <div>
+      <label>API key</label>
+      <input id="inp-key" value="demo-key" placeholder="my-app-key" />
+    </div>
+    <div>
+      <label>Room ID</label>
+      <input id="inp-room" value="main" placeholder="room-1" />
+    </div>
+    <div>
+      <label>Persistence</label>
+      <select id="inp-persistence">
+        <option value="storage">storage (survives hibernation)</option>
+        <option value="memory">memory (cleared on hibernation)</option>
+      </select>
+    </div>
+
+    <button id="connect-btn">Connect</button>
+  </div>
+</div>
+
+<!-- Main app -->
+<div id="app">
+  <!-- KV store -->
+  <div class="panel" id="kv-panel">
+    <div class="panel-header">
+      <span>Key-Value Store</span>
+      <span id="kv-count" style="font-weight:400">0 entries</span>
+    </div>
+    <div id="kv-form">
+      <input id="inp-kv-key" placeholder="key" />
+      <input id="inp-kv-value" placeholder="value (any JSON)" />
+      <button id="btn-kv-set">Set</button>
+    </div>
+    <div id="kv-list">
+      <div class="empty-state">No entries yet. Set a key above.</div>
+    </div>
+  </div>
+
+  <!-- Chat -->
+  <div class="panel" id="chat-panel">
+    <div class="panel-header">Chat (broadcast)</div>
+    <div id="messages"></div>
+    <div id="chat-form">
+      <input id="inp-chat" placeholder="Message…" />
+      <button id="btn-send">Send</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="/src/main.ts"></script>
+</body>
+</html>
