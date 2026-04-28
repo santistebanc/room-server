@@ -94,10 +94,12 @@ export default class RoomServer implements Party.Server {
       return;
     }
 
-    await this.ensureInit(authResult.appId, persistence);
-
+    // Increment before the await so concurrent onConnect calls can't both
+    // pass the limit check and overshoot maxConnections.
     this.connectionCount++;
     this.subscriptions.set(conn.id, new Set());
+
+    await this.ensureInit(authResult.appId, persistence);
 
     // Record presence.
     const presenceKey = `presence/${conn.id}`;
@@ -145,9 +147,11 @@ export default class RoomServer implements Party.Server {
   }
 
   async onClose(conn: Party.Connection) {
+    // Only decrement if this connection was actually accepted (i.e. made it past auth/limit checks).
+    const wasAccepted = this.subscriptions.has(conn.id);
     this.subscriptions.delete(conn.id);
     this.rateLimits.delete(conn.id);
-    this.connectionCount = Math.max(0, this.connectionCount - 1);
+    if (wasAccepted) this.connectionCount = Math.max(0, this.connectionCount - 1);
 
     if (this.ready) {
       const presenceKey = `presence/${conn.id}`;
@@ -257,7 +261,7 @@ export default class RoomServer implements Party.Server {
         if (body.key.startsWith(META) || body.key.startsWith("presence/"))
           return cors(new Response("Reserved key prefix", { status: 400 }));
         await this.store.set(body.key, body.value);
-        await this.clearTTL(body.key);
+        await this.clearTTL(body.key, !!body.ttl);
         if (body.ttl) await this.scheduleTTL(body.key, body.ttl);
         this.notifySubscribers(body.key, body.value, "");
         return cors(Response.json({ ok: true }));
@@ -295,7 +299,7 @@ export default class RoomServer implements Party.Server {
           break;
         }
         await this.store.set(msg.key, msg.value);
-        await this.clearTTL(msg.key);
+        await this.clearTTL(msg.key, !!msg.ttl);
         if (msg.ttl) await this.scheduleTTL(msg.key, msg.ttl);
         send(conn, { op: "ack", requestId: msg.requestId });
         this.notifySubscribers(msg.key, msg.value, conn.id);
@@ -517,7 +521,7 @@ export default class RoomServer implements Party.Server {
     }
 
     const fireAt = await dos.get<number>(`${META}alarm/fireAt`);
-    if (fireAt && fireAt > now) pick(fireAt);
+    if (fireAt && fireAt >= now) pick(fireAt);
 
     const rec = await dos.get<{ interval: number }>(`${META}alarm/recurring`);
     if (rec) pick(now + rec.interval * 1000);
@@ -526,12 +530,12 @@ export default class RoomServer implements Party.Server {
     else await dos.deleteAlarm();
   }
 
-  private async clearTTL(key: string) {
+  private async clearTTL(key: string, skipReschedule = false) {
     const dos = this.party.storage as unknown as DurableObjectStorage;
     const had = await dos.get(`${META}ttl/${key}`);
     if (had !== undefined) {
       await dos.delete(`${META}ttl/${key}`);
-      await this.rescheduleNextAlarm(dos);
+      if (!skipReschedule) await this.rescheduleNextAlarm(dos);
     }
   }
 
@@ -541,6 +545,7 @@ export default class RoomServer implements Party.Server {
     if (expiresAt !== undefined && expiresAt <= Date.now()) {
       await this.store.delete(key);
       await dos.delete(`${META}ttl/${key}`);
+      this.notifySubscribers(key, null, "", true);
       return null;
     }
     return this.store.get(key);

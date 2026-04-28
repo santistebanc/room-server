@@ -84,8 +84,14 @@ export class RoomClient {
 
   // ── Handshake ───────────────────────────────────────────────────────────────
 
-  ready(): Promise<void> {
-    return this.readyPromise;
+  ready(timeoutMs = 10_000): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("room-server: ready() timed out")),
+        timeoutMs
+      );
+      this.readyPromise.then(() => { clearTimeout(timer); resolve(); }, reject);
+    });
   }
 
   // ── CRUD ────────────────────────────────────────────────────────────────────
