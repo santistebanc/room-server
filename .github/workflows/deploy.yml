@@ -32,11 +32,6 @@ jobs:
         env:
           PARTYKIT_TOKEN: ${{ secrets.PARTYKIT_TOKEN }}
 
-      - name: Login to PartyKit (if needed)
-        run: echo "$PARTYKIT_TOKEN" | npx partykit login --token-stdin
-        env:
-          PARTYKIT_TOKEN: ${{ secrets.PARTYKIT_TOKEN }}
-
       - name: Deploy to PartyKit
         run: DEBUG=* npx partykit deploy
         env:
