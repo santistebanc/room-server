@@ -223,9 +223,10 @@ export default class RoomServer implements Party.Server {
     // Pre-flight must succeed before auth — browsers send OPTIONS without credentials.
     if (req.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
 
+    const url = new URL(req.url);
     const apiKey =
       req.headers.get("Authorization")?.replace(/^Bearer\s+/, "") ??
-      new URL(req.url).searchParams.get("apiKey") ??
+      url.searchParams.get("apiKey") ??
       "";
 
     const authResult = this.authenticate(apiKey, this.party.env as Env);
@@ -240,8 +241,6 @@ export default class RoomServer implements Party.Server {
     if (!this.ready) {
       await this.ensureInit(authResult.appId, "storage");
     }
-
-    const url = new URL(req.url);
 
     try {
       if (req.method === "GET") {
@@ -276,6 +275,8 @@ export default class RoomServer implements Party.Server {
         };
         if (typeof body.key !== "string" || !body.key)
           return cors(new Response("Missing or invalid key", { status: 400 }));
+        if (!("value" in (body as object)))
+          return cors(new Response("Missing value", { status: 400 }));
         if (body.key.startsWith(META) || body.key.startsWith("presence/"))
           return cors(new Response("Reserved key prefix", { status: 400 }));
         await this.store.set(body.key, body.value);

@@ -212,6 +212,8 @@ curl -X DELETE "https://room-server.<user>.partykit.dev/parties/room/key-app1:my
 
 HTTP writes trigger real-time change notifications to subscribed WebSocket clients.
 
+> **Note:** The HTTP API supports only basic get/set/delete/list. Atomic operations (`increment`, `set_if`) are WebSocket-only. If you need a counter or compare-and-swap from an HTTP context, use a WebSocket connection instead — an HTTP read-then-write is not atomic and will race under concurrent access.
+
 ---
 
 ## Persistence levels
