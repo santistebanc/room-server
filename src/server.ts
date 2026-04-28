@@ -103,8 +103,9 @@ export default class RoomServer implements Party.Server {
 
     // Record presence.
     const presenceKey = `presence/${conn.id}`;
-    await this.store.set(presenceKey, { connectedAt: Date.now() });
-    this.notifySubscribers(presenceKey, { connectedAt: Date.now() }, conn.id);
+    const presenceValue = { connectedAt: Date.now() };
+    await this.store.set(presenceKey, presenceValue);
+    this.notifySubscribers(presenceKey, presenceValue, conn.id);
 
     send(conn, {
       op: "ready",
@@ -192,12 +193,16 @@ export default class RoomServer implements Party.Server {
       await dos.delete(`${META}alarm/action`);
     }
 
-    // 3. Execute recurring action (if any).
-    const recurring = await dos.get<{ interval: number; action: AlarmAction }>(
+    // 3. Execute recurring action only when its own scheduled time has arrived.
+    const recurring = await dos.get<{ interval: number; action: AlarmAction; nextAt: number }>(
       `${META}alarm/recurring`
     );
-    if (recurring) {
+    if (recurring && recurring.nextAt <= now) {
       try { await this.executeAction(recurring.action); } catch {}
+      await dos.put(`${META}alarm/recurring`, {
+        ...recurring,
+        nextAt: now + recurring.interval * 1000,
+      });
     }
 
     // Reschedule based on all remaining pending alarms.
@@ -430,7 +435,11 @@ export default class RoomServer implements Party.Server {
           break;
         }
         const dos = this.party.storage as unknown as DurableObjectStorage;
-        await dos.put(`${META}alarm/recurring`, { interval: msg.interval, action: msg.action });
+        await dos.put(`${META}alarm/recurring`, {
+          interval: msg.interval,
+          action: msg.action,
+          nextAt: Date.now() + msg.interval * 1000,
+        });
         await this.rescheduleNextAlarm(dos);
         send(conn, { op: "ack", requestId: msg.requestId });
         break;
@@ -546,8 +555,8 @@ export default class RoomServer implements Party.Server {
     // Clamp to at least now+1 so delay=0 alarms are always scheduled.
     if (fireAt) pick(Math.max(fireAt, now + 1));
 
-    const rec = await dos.get<{ interval: number }>(`${META}alarm/recurring`);
-    if (rec) pick(now + rec.interval * 1000);
+    const rec = await dos.get<{ nextAt: number }>(`${META}alarm/recurring`);
+    if (rec) pick(Math.max(rec.nextAt, now + 1));
 
     if (next !== null) await dos.setAlarm(next);
     else await dos.deleteAlarm();
