@@ -165,22 +165,29 @@ export default class RoomServer implements Party.Server {
     const dos = this.party.storage as unknown as DurableObjectStorage;
     const now = Date.now();
 
-    // 1. Sweep expired TTL keys.
-    const ttlEntries = await dos.list<number>({ prefix: `${META}ttl/` });
-    for (const [ttlKey, expiresAt] of ttlEntries) {
-      if (expiresAt <= now) {
-        const key = ttlKey.slice(`${META}ttl/`.length);
-        await this.store.delete(key);
-        await dos.delete(ttlKey);
-        this.notifySubscribers(key, null, "", true);
+    // 1. Sweep expired TTL keys (paginate — DO storage returns max 128 per call).
+    let ttlCursor: string | undefined;
+    do {
+      const ttlPage = await dos.list<number>({ prefix: `${META}ttl/`, startAfter: ttlCursor });
+      for (const [ttlKey, expiresAt] of ttlPage) {
+        if (expiresAt <= now) {
+          const key = ttlKey.slice(`${META}ttl/`.length);
+          await this.store.delete(key);
+          await dos.delete(ttlKey);
+          this.notifySubscribers(key, null, "", true);
+        }
+        ttlCursor = ttlKey;
       }
-    }
+      if (ttlPage.size < 128) break;
+    } while (true);
 
     // 2. Execute one-shot alarm if its scheduled time has arrived.
     const fireAt = await dos.get<number>(`${META}alarm/fireAt`);
     const alarmAction = await dos.get<AlarmAction>(`${META}alarm/action`);
     if (fireAt && fireAt <= now) {
-      if (alarmAction) await this.executeAction(alarmAction);
+      if (alarmAction) {
+        try { await this.executeAction(alarmAction); } catch {}
+      }
       await dos.delete(`${META}alarm/fireAt`);
       await dos.delete(`${META}alarm/action`);
     }
@@ -190,7 +197,7 @@ export default class RoomServer implements Party.Server {
       `${META}alarm/recurring`
     );
     if (recurring) {
-      await this.executeAction(recurring.action);
+      try { await this.executeAction(recurring.action); } catch {}
     }
 
     // Reschedule based on all remaining pending alarms.
@@ -516,12 +523,20 @@ export default class RoomServer implements Party.Server {
 
     const pick = (t: number) => { next = next === null ? t : Math.min(next, t); };
 
-    for (const expiresAt of (await dos.list<number>({ prefix: `${META}ttl/` })).values()) {
-      if (expiresAt > now) pick(expiresAt);
-    }
+    // Paginate — DO storage list() returns max 128 entries per call.
+    let ttlCursor: string | undefined;
+    do {
+      const ttlPage = await dos.list<number>({ prefix: `${META}ttl/`, startAfter: ttlCursor });
+      for (const [k, expiresAt] of ttlPage) {
+        if (expiresAt > now) pick(expiresAt);
+        ttlCursor = k;
+      }
+      if (ttlPage.size < 128) break;
+    } while (true);
 
     const fireAt = await dos.get<number>(`${META}alarm/fireAt`);
-    if (fireAt && fireAt >= now) pick(fireAt);
+    // Clamp to at least now+1 so delay=0 alarms are always scheduled.
+    if (fireAt) pick(Math.max(fireAt, now + 1));
 
     const rec = await dos.get<{ interval: number }>(`${META}alarm/recurring`);
     if (rec) pick(now + rec.interval * 1000);
