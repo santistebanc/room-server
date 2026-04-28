@@ -18,6 +18,7 @@ export default class RoomServer implements Party.Server {
   private appId!: string;
   private roomId!: string;
   private ready = false;
+  private initPromise: Promise<void> | null = null;
 
   // connectionId → set of subscribed prefixes
   private subscriptions = new Map<string, Set<string>>();
@@ -62,13 +63,15 @@ export default class RoomServer implements Party.Server {
       );
       this.connectionCount = liveIds.size;
 
-      const presencePage = await this.store.list("presence/");
-      for (const key of Object.keys(presencePage.entries)) {
-        const connId = key.slice("presence/".length);
-        if (!liveIds.has(connId)) {
-          await this.store.delete(key);
+      let presenceCursor: string | undefined;
+      do {
+        const presencePage = await this.store.list("presence/", 100, presenceCursor);
+        for (const key of Object.keys(presencePage.entries)) {
+          const connId = key.slice("presence/".length);
+          if (!liveIds.has(connId)) await this.store.delete(key);
         }
-      }
+        presenceCursor = presencePage.nextCursor;
+      } while (presenceCursor);
     }
   }
 
@@ -154,6 +157,7 @@ export default class RoomServer implements Party.Server {
   }
 
   async onAlarm() {
+    if (!this.ready) return;
     const dos = this.party.storage as unknown as DurableObjectStorage;
     const now = Date.now();
 
@@ -227,6 +231,7 @@ export default class RoomServer implements Party.Server {
         const cursor = url.searchParams.get("cursor") ?? undefined;
 
         if (key !== null) {
+          if (key.startsWith(META)) return cors(Response.json({ key, value: null }));
           const value = await this.getWithTTLCheck(key);
           return cors(Response.json({ key, value }));
         }
@@ -249,6 +254,8 @@ export default class RoomServer implements Party.Server {
           value: unknown;
           ttl?: number;
         };
+        if (body.key.startsWith(META) || body.key.startsWith("presence/"))
+          return cors(new Response("Reserved key prefix", { status: 400 }));
         await this.store.set(body.key, body.value);
         await this.clearTTL(body.key);
         if (body.ttl) await this.scheduleTTL(body.key, body.ttl);
@@ -259,7 +266,10 @@ export default class RoomServer implements Party.Server {
       if (req.method === "DELETE") {
         const key = url.searchParams.get("key");
         if (!key) return cors(new Response("Missing key", { status: 400 }));
+        if (key.startsWith(META) || key.startsWith("presence/"))
+          return cors(new Response("Reserved key prefix", { status: 400 }));
         await this.store.delete(key);
+        await this.clearTTL(key);
         this.notifySubscribers(key, null, "", true);
         return cors(Response.json({ ok: true }));
       }
@@ -280,6 +290,10 @@ export default class RoomServer implements Party.Server {
   private async handle(msg: ClientMsg, conn: Party.Connection) {
     switch (msg.op) {
       case "set": {
+        if (msg.key.startsWith(META) || msg.key.startsWith("presence/")) {
+          send(conn, { op: "error", requestId: msg.requestId, message: "Reserved key prefix" });
+          break;
+        }
         await this.store.set(msg.key, msg.value);
         await this.clearTTL(msg.key);
         if (msg.ttl) await this.scheduleTTL(msg.key, msg.ttl);
@@ -289,12 +303,20 @@ export default class RoomServer implements Party.Server {
       }
 
       case "get": {
+        if (msg.key.startsWith(META)) {
+          send(conn, { op: "result", requestId: msg.requestId, key: msg.key, value: null });
+          break;
+        }
         const value = await this.getWithTTLCheck(msg.key);
         send(conn, { op: "result", requestId: msg.requestId, key: msg.key, value });
         break;
       }
 
       case "delete": {
+        if (msg.key.startsWith(META) || msg.key.startsWith("presence/")) {
+          send(conn, { op: "error", requestId: msg.requestId, message: "Reserved key prefix" });
+          break;
+        }
         await this.store.delete(msg.key);
         await this.clearTTL(msg.key);
         send(conn, { op: "ack", requestId: msg.requestId });
@@ -315,7 +337,11 @@ export default class RoomServer implements Party.Server {
       }
 
       case "increment": {
-        const current = await this.store.get(msg.key);
+        if (msg.key.startsWith(META) || msg.key.startsWith("presence/")) {
+          send(conn, { op: "error", requestId: msg.requestId, message: "Reserved key prefix" });
+          break;
+        }
+        const current = await this.getWithTTLCheck(msg.key);
         const num = typeof current === "number" ? current : 0;
         const next = num + (msg.delta ?? 1);
         await this.store.set(msg.key, next);
@@ -325,7 +351,11 @@ export default class RoomServer implements Party.Server {
       }
 
       case "set_if": {
-        const current = await this.store.get(msg.key);
+        if (msg.key.startsWith(META) || msg.key.startsWith("presence/")) {
+          send(conn, { op: "error", requestId: msg.requestId, message: "Reserved key prefix" });
+          break;
+        }
+        const current = await this.getWithTTLCheck(msg.key);
         const match = deepEqual(current, msg.ifValue);
         if (match) {
           await this.store.set(msg.key, msg.value);
@@ -356,7 +386,8 @@ export default class RoomServer implements Party.Server {
           channel: msg.channel,
           data: msg.data,
         };
-        this.party.broadcast(JSON.stringify(broadcastMsg));
+        // Exclude sender — consistent with subscribe change fanout.
+        this.party.broadcast(JSON.stringify(broadcastMsg), [conn.id]);
         break;
       }
 
@@ -447,8 +478,21 @@ export default class RoomServer implements Party.Server {
         if (!k.startsWith(META)) entries[k] = v;
       }
       nextCursor = page.nextCursor;
-      if (Object.keys(entries).length > 0 || !nextCursor) break;
+      const userCount = Object.keys(entries).length;
+      // Stop when we have no more pages, or have met the requested limit.
+      if (!nextCursor || (limit !== undefined && userCount >= limit)) break;
       fetchCursor = nextCursor;
+    }
+
+    // Trim if a page boundary caused overshoot beyond limit.
+    if (limit) {
+      const keys = Object.keys(entries);
+      if (keys.length > limit) {
+        const trimmed: Record<string, unknown> = {};
+        for (const k of keys.slice(0, limit)) trimmed[k] = entries[k];
+        // Use the last included key as nextCursor so the next page starts after it.
+        return { entries: trimmed, nextCursor: keys[limit - 1] };
+      }
     }
 
     return { entries, nextCursor };
@@ -484,7 +528,11 @@ export default class RoomServer implements Party.Server {
 
   private async clearTTL(key: string) {
     const dos = this.party.storage as unknown as DurableObjectStorage;
-    await dos.delete(`${META}ttl/${key}`);
+    const had = await dos.get(`${META}ttl/${key}`);
+    if (had !== undefined) {
+      await dos.delete(`${META}ttl/${key}`);
+      await this.rescheduleNextAlarm(dos);
+    }
   }
 
   private async getWithTTLCheck(key: string): Promise<unknown> {
@@ -562,8 +610,13 @@ export default class RoomServer implements Party.Server {
 
   // ── Init ────────────────────────────────────────────────────────────────────
 
-  private async ensureInit(appId: string, persistence: PersistenceLevel) {
-    if (this.ready) return;
+  private ensureInit(appId: string, persistence: PersistenceLevel): Promise<void> {
+    if (this.ready) return Promise.resolve();
+    if (!this.initPromise) this.initPromise = this._doInit(appId, persistence);
+    return this.initPromise;
+  }
+
+  private async _doInit(appId: string, persistence: PersistenceLevel): Promise<void> {
     const dos = this.party.storage as unknown as DurableObjectStorage;
     this.appId = appId;
     this.roomId = this.party.id.includes(":")
