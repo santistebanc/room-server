@@ -274,6 +274,7 @@ export class RoomClient {
   }
 }
 
+let _uidCounter = 0;
 function uid() {
-  return Math.random().toString(36).slice(2);
+  return (++_uidCounter).toString(36);
 }

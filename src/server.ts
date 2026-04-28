@@ -211,6 +211,9 @@ export default class RoomServer implements Party.Server {
   // DELETE /parties/room/{id}?key=path      → { ok }
 
   async onRequest(req: Party.Request): Promise<Response> {
+    // Pre-flight must succeed before auth — browsers send OPTIONS without credentials.
+    if (req.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
+
     const apiKey =
       req.headers.get("Authorization")?.replace(/^Bearer\s+/, "") ??
       new URL(req.url).searchParams.get("apiKey") ??
@@ -220,9 +223,6 @@ export default class RoomServer implements Party.Server {
     if (!authResult.ok) {
       return cors(new Response("Unauthorized", { status: 401 }));
     }
-
-    // Allow pre-flight.
-    if (req.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
 
     if (!this.checkHttpRateLimit(authResult.appId)) {
       return cors(new Response("Rate limit exceeded", { status: 429 }));
@@ -403,6 +403,10 @@ export default class RoomServer implements Party.Server {
       }
 
       case "schedule_alarm": {
+        if (msg.delay < 0) {
+          send(conn, { op: "error", requestId: msg.requestId, message: "delay must be >= 0" });
+          break;
+        }
         const dos = this.party.storage as unknown as DurableObjectStorage;
         await dos.put(`${META}alarm/fireAt`, Date.now() + msg.delay * 1000);
         await dos.put(`${META}alarm/action`, msg.action ?? null);
@@ -421,6 +425,10 @@ export default class RoomServer implements Party.Server {
       }
 
       case "schedule_recurring": {
+        if (msg.interval <= 0) {
+          send(conn, { op: "error", requestId: msg.requestId, message: "interval must be > 0" });
+          break;
+        }
         const dos = this.party.storage as unknown as DurableObjectStorage;
         await dos.put(`${META}alarm/recurring`, { interval: msg.interval, action: msg.action });
         await this.rescheduleNextAlarm(dos);
