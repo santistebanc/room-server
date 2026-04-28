@@ -17,6 +17,7 @@
   "scripts": {
     "login": "partykit login",
     "build": "tsc",
+    "prepare": "tsc",
     "dev": "partykit dev",
     "deploy": "partykit deploy"
   },

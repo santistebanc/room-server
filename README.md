@@ -39,16 +39,17 @@ https://room-server.<your-username>.partykit.dev
 
 ### Install
 
-Copy `src/client.ts` and `src/types.ts` into your project, or reference them directly. The only runtime dependency is `partysocket`:
-
 ```bash
-npm install partysocket
+npm install github:santistebanc/room-server
 ```
+
+This installs the client SDK directly from GitHub. The `prepare` script compiles TypeScript automatically on install — no extra steps needed.
 
 ### Connect
 
 ```ts
-import { RoomClient } from "./client";
+import { RoomClient } from "room-server/client";
+import type { ConnectConfig } from "room-server/types";
 
 const room = new RoomClient({
   host: "room-server.<your-username>.partykit.dev",
