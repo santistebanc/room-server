@@ -16,8 +16,13 @@ jobs:
 
       - run: npm ci
 
+      - name: Verify PartyKit authentication
+        run: npx partykit whoami
+        env:
+          PARTYKIT_TOKEN: ${{ secrets.PARTYKIT_TOKEN }}
+
       - name: Deploy to PartyKit
-        run: npx partykit deploy
+        run: DEBUG=* npx partykit deploy
         env:
           PARTYKIT_TOKEN: ${{ secrets.PARTYKIT_TOKEN }}
 
