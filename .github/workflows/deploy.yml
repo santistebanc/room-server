@@ -25,7 +25,8 @@ jobs:
             echo "PARTYKIT_TOKEN is set (length: ${#PARTYKIT_TOKEN})"
           fi
           if [ -z "$PARTYKIT_LOGIN" ]; then
-            echo "WARNING: PARTYKIT_LOGIN is not set"
+            echo "ERROR: PARTYKIT_LOGIN is not set"
+            exit 1
           else
             echo "PARTYKIT_LOGIN is set (value: $PARTYKIT_LOGIN)"
           fi
@@ -40,7 +41,7 @@ jobs:
           PARTYKIT_LOGIN: ${{ secrets.PARTYKIT_LOGIN }}
 
       - name: Deploy to PartyKit
-        run: DEBUG=* npx partykit deploy
+        run: npx partykit deploy
         env:
           PARTYKIT_TOKEN: ${{ secrets.PARTYKIT_TOKEN }}
           PARTYKIT_LOGIN: ${{ secrets.PARTYKIT_LOGIN }}
