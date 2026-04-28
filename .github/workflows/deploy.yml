@@ -1,0 +1,31 @@
+name: Deploy
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Deploy to PartyKit
+        run: npx partykit deploy
+        env:
+          PARTYKIT_TOKEN: ${{ secrets.PARTYKIT_TOKEN }}
+
+      - name: Show server URL
+        run: |
+          USERNAME=$(npx partykit whoami 2>/dev/null | tr -d '[:space:]')
+          echo "Server URL: https://room-server.${USERNAME}.partykit.dev"
+        env:
+          PARTYKIT_TOKEN: ${{ secrets.PARTYKIT_TOKEN }}
