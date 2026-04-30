@@ -1,6 +1,6 @@
 {
   "name": "room-server",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Generic PartyKit backend — real-time KV, subscriptions, presence, and broadcast for any app.",
   "main": "dist/server.js",
   "types": "dist/server.d.ts",
@@ -8,6 +8,10 @@
     "./client": {
       "types": "./dist/client.d.ts",
       "default": "./dist/client.js"
+    },
+    "./mock": {
+      "types": "./dist/mock.d.ts",
+      "default": "./dist/mock.js"
     },
     "./types": {
       "types": "./dist/types.d.ts",

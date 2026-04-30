@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # `npm ci` runs the `prepare` script which compiles the SDK to dist/.
+      # If this fails, consumer `npm install github:...` would also fail.
+      - run: npm ci
+
+      # Explicit build step so a tsc failure has a clearly-named CI step.
+      - run: npm run build
+
+      # Smoke-test the example app builds against the current source. Catches
+      # regressions to the public client API that the unit-of-distribution
+      # `dist/` artifact wouldn't surface on its own.
+      - name: Build example
+        working-directory: example
+        run: |
+          npm install --no-audit --no-fund
+          npx vite build

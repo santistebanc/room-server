@@ -6,11 +6,32 @@ import type {
   ClientMsg,
   Env,
   PersistenceLevel,
+  RateLimitInfo,
   ServerMsg,
 } from "./types.js";
 
 // Internal storage key prefix — never exposed to clients via list().
 const META = "__rs/";
+
+// Per-connection subscription state.
+//   - keys:     exact-key subscriptions, target -> { includeSelf }.
+//   - prefixes: prefix subscriptions,    target -> { includeSelf }.
+// A subscribing client may overwrite includeSelf by re-sending subscribe with
+// a different value; unsubscribe removes the entry regardless of includeSelf.
+interface ConnSubs {
+  keys: Map<string, { includeSelf: boolean }>;
+  prefixes: Map<string, { includeSelf: boolean }>;
+}
+
+interface RateBucket {
+  count: number;
+  windowStart: number;
+  warned: boolean;
+}
+
+interface RateCheckResult extends RateLimitInfo {
+  allowed: boolean;
+}
 
 export default class RoomServer implements Party.Server {
   private store!: Store;
@@ -20,13 +41,10 @@ export default class RoomServer implements Party.Server {
   private ready = false;
   private initPromise: Promise<void> | null = null;
 
-  // connectionId → set of subscribed prefixes
-  private subscriptions = new Map<string, Set<string>>();
+  private subscriptions = new Map<string, ConnSubs>();
 
-  // Rate limiting: connectionId → { count, windowStart }
-  private rateLimits = new Map<string, { count: number; windowStart: number }>();
-  // HTTP rate limiting: apiKey → { count, windowStart }
-  private httpRateLimits = new Map<string, { count: number; windowStart: number }>();
+  private rateLimits = new Map<string, RateBucket>();
+  private httpRateLimits = new Map<string, RateBucket>();
   private rateLimitOps = 100;
   private rateLimitWindowMs = 10_000;
   private maxConnections = 100;
@@ -60,10 +78,8 @@ export default class RoomServer implements Party.Server {
       // keys are valid. On crash, connections drop and old presence keys are orphaned.
       const liveConnections = [...this.party.getConnections()];
       this.connectionCount = liveConnections.length;
-      // Populate subscriptions so re-subscribe messages and onClose work correctly
-      // after hibernation wakeup (onConnect is not re-fired for existing connections).
       for (const conn of liveConnections) {
-        this.subscriptions.set(conn.id, new Set());
+        this.subscriptions.set(conn.id, emptyConnSubs());
       }
       const liveIds = new Set(liveConnections.map((c) => c.id));
 
@@ -101,21 +117,21 @@ export default class RoomServer implements Party.Server {
     // Increment before the await so concurrent onConnect calls can't both
     // pass the limit check and overshoot maxConnections.
     this.connectionCount++;
-    this.subscriptions.set(conn.id, new Set());
+    this.subscriptions.set(conn.id, emptyConnSubs());
 
     await this.ensureInit(authResult.appId, persistence);
 
-    // Record presence.
     const presenceKey = `presence/${conn.id}`;
     const presenceValue = { connectedAt: Date.now() };
     await this.store.set(presenceKey, presenceValue);
-    this.notifySubscribers(presenceKey, presenceValue, conn.id);
+    this.notifySet(presenceKey, presenceValue, conn.id);
 
     send(conn, {
       op: "ready",
       persistence: this.persistence,
       appId: this.appId,
       roomId: this.roomId,
+      connectionId: conn.id,
     });
   }
 
@@ -125,10 +141,16 @@ export default class RoomServer implements Party.Server {
       return;
     }
 
-    if (!this.checkRateLimit(conn.id)) {
-      send(conn, { op: "error", message: "Rate limit exceeded" });
+    const rate = this.checkRateLimit(conn.id);
+    if (!rate.allowed) {
+      send(conn, {
+        op: "error",
+        message: "Rate limit exceeded",
+        rateLimit: toRateLimitInfo(rate),
+      });
       return;
     }
+    this.maybeWarnRateLimit(conn, conn.id, rate);
 
     let msg: ClientMsg;
     try {
@@ -161,7 +183,7 @@ export default class RoomServer implements Party.Server {
     if (this.ready) {
       const presenceKey = `presence/${conn.id}`;
       await this.store.delete(presenceKey);
-      this.notifySubscribers(presenceKey, null, conn.id, true);
+      this.notifyDelete(presenceKey, conn.id);
     }
   }
 
@@ -179,7 +201,7 @@ export default class RoomServer implements Party.Server {
           const key = ttlKey.slice(`${META}ttl/`.length);
           await this.store.delete(key);
           await dos.delete(ttlKey);
-          this.notifySubscribers(key, null, "", true);
+          this.notifyDelete(key, null);
         }
         ttlCursor = ttlKey;
       }
@@ -209,7 +231,6 @@ export default class RoomServer implements Party.Server {
       });
     }
 
-    // Reschedule based on all remaining pending alarms.
     await this.rescheduleNextAlarm(dos);
   }
 
@@ -220,7 +241,6 @@ export default class RoomServer implements Party.Server {
   // DELETE /parties/room/{id}?key=path      → { ok }
 
   async onRequest(req: Party.Request): Promise<Response> {
-    // Pre-flight must succeed before auth — browsers send OPTIONS without credentials.
     if (req.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
 
     const url = new URL(req.url);
@@ -234,8 +254,19 @@ export default class RoomServer implements Party.Server {
       return cors(new Response("Unauthorized", { status: 401 }));
     }
 
-    if (!this.checkHttpRateLimit(authResult.appId)) {
-      return cors(new Response("Rate limit exceeded", { status: 429 }));
+    const rate = this.checkHttpRateLimit(authResult.appId);
+    if (!rate.allowed) {
+      const headers = new Headers({ "Content-Type": "application/json" });
+      headers.set("X-RateLimit-Limit", String(rate.limit));
+      headers.set("X-RateLimit-Remaining", String(rate.remaining));
+      headers.set("X-RateLimit-Reset", String(rate.resetAt));
+      headers.set("Retry-After", String(Math.max(1, Math.ceil((rate.resetAt - Date.now()) / 1000))));
+      return cors(
+        new Response(
+          JSON.stringify({ error: "Rate limit exceeded", rateLimit: toRateLimitInfo(rate) }),
+          { status: 429, headers }
+        )
+      );
     }
 
     if (!this.ready) {
@@ -251,7 +282,7 @@ export default class RoomServer implements Party.Server {
 
         if (key !== null) {
           if (key.startsWith(META)) return cors(Response.json({ key, value: null }));
-          const value = await this.getWithTTLCheck(key);
+          const value = await this.getWithTTLCheck(key, null);
           return cors(Response.json({ key, value }));
         }
 
@@ -282,7 +313,7 @@ export default class RoomServer implements Party.Server {
         await this.store.set(body.key, body.value);
         await this.clearTTL(body.key, !!body.ttl);
         if (body.ttl) await this.scheduleTTL(body.key, body.ttl);
-        this.notifySubscribers(body.key, body.value, "");
+        this.notifySet(body.key, body.value, null);
         return cors(Response.json({ ok: true }));
       }
 
@@ -293,7 +324,7 @@ export default class RoomServer implements Party.Server {
           return cors(new Response("Reserved key prefix", { status: 400 }));
         await this.store.delete(key);
         await this.clearTTL(key);
-        this.notifySubscribers(key, null, "", true);
+        this.notifyDelete(key, null);
         return cors(Response.json({ ok: true }));
       }
     } catch (err) {
@@ -321,7 +352,7 @@ export default class RoomServer implements Party.Server {
         await this.clearTTL(msg.key, !!msg.ttl);
         if (msg.ttl) await this.scheduleTTL(msg.key, msg.ttl);
         send(conn, { op: "ack", requestId: msg.requestId });
-        this.notifySubscribers(msg.key, msg.value, conn.id);
+        this.notifySet(msg.key, msg.value, conn.id);
         break;
       }
 
@@ -343,7 +374,7 @@ export default class RoomServer implements Party.Server {
         await this.store.delete(msg.key);
         await this.clearTTL(msg.key);
         send(conn, { op: "ack", requestId: msg.requestId });
-        this.notifySubscribers(msg.key, null, conn.id, true);
+        this.notifyDelete(msg.key, conn.id);
         break;
       }
 
@@ -369,7 +400,7 @@ export default class RoomServer implements Party.Server {
         const next = num + (msg.delta ?? 1);
         await this.store.set(msg.key, next);
         send(conn, { op: "result", requestId: msg.requestId, key: msg.key, value: next });
-        this.notifySubscribers(msg.key, next, conn.id);
+        this.notifySet(msg.key, next, conn.id);
         break;
       }
 
@@ -382,7 +413,7 @@ export default class RoomServer implements Party.Server {
         const match = deepEqual(current, msg.ifValue);
         if (match) {
           await this.store.set(msg.key, msg.value);
-          this.notifySubscribers(msg.key, msg.value, conn.id);
+          this.notifySet(msg.key, msg.value, conn.id);
         }
         send(conn, {
           op: "set_if_result",
@@ -393,13 +424,127 @@ export default class RoomServer implements Party.Server {
         break;
       }
 
-      case "subscribe": {
-        this.subscriptions.get(conn.id)?.add(msg.prefix);
+      case "touch": {
+        if (msg.key.startsWith(META) || msg.key.startsWith("presence/")) {
+          send(conn, { op: "error", requestId: msg.requestId, message: "Reserved key prefix" });
+          break;
+        }
+        if (typeof msg.ttl !== "number" || msg.ttl <= 0) {
+          send(conn, { op: "error", requestId: msg.requestId, message: "ttl must be > 0" });
+          break;
+        }
+        // Touch only refreshes TTL on keys that have a value. The store's get()
+        // collapses missing-key and stored-null to null, so touch on null-valued
+        // keys is rejected too.
+        const current = await this.store.get(msg.key);
+        if (current === null || current === undefined) {
+          send(conn, {
+            op: "error",
+            requestId: msg.requestId,
+            message: "Cannot touch key (does not exist or is null)",
+          });
+          break;
+        }
+        await this.scheduleTTL(msg.key, msg.ttl);
+        send(conn, { op: "ack", requestId: msg.requestId });
         break;
       }
 
-      case "unsubscribe": {
-        this.subscriptions.get(conn.id)?.delete(msg.prefix);
+      case "delete_prefix": {
+        if (
+          msg.prefix.startsWith(META) ||
+          msg.prefix.startsWith("presence/") ||
+          msg.prefix === ""
+        ) {
+          send(conn, {
+            op: "error",
+            requestId: msg.requestId,
+            message:
+              msg.prefix === ""
+                ? "delete_prefix requires a non-empty prefix"
+                : "Reserved key prefix",
+          });
+          break;
+        }
+        const deleted = await this.deletePrefix(msg.prefix, conn.id);
+        send(conn, {
+          op: "delete_prefix_result",
+          requestId: msg.requestId,
+          deleted,
+        });
+        break;
+      }
+
+      case "snapshot": {
+        const keysOut: Record<string, unknown> = {};
+        const prefixesOut: Record<string, Record<string, unknown>> = {};
+
+        if (msg.keys) {
+          for (const k of msg.keys) {
+            if (k.startsWith(META)) continue;
+            keysOut[k] = await this.getWithTTLCheck(k, conn.id);
+          }
+        }
+
+        if (msg.prefixes) {
+          for (const p of msg.prefixes) {
+            if (p !== "" && !p.endsWith("/")) {
+              send(conn, {
+                op: "error",
+                requestId: msg.requestId,
+                message: "Prefix must end with '/' or be empty string",
+              });
+              return;
+            }
+            prefixesOut[p] = await this.collectAllUserKeys(p);
+          }
+        }
+
+        send(conn, {
+          op: "snapshot_result",
+          requestId: msg.requestId,
+          keys: keysOut,
+          prefixes: prefixesOut,
+        });
+        break;
+      }
+
+      case "subscribe_key": {
+        const subs = this.subscriptions.get(conn.id);
+        if (!subs) break;
+        if (msg.key.startsWith(META)) {
+          send(conn, { op: "error", message: "Reserved key prefix" });
+          break;
+        }
+        subs.keys.set(msg.key, { includeSelf: msg.includeSelf === true });
+        break;
+      }
+
+      case "subscribe_prefix": {
+        const subs = this.subscriptions.get(conn.id);
+        if (!subs) break;
+        if (msg.prefix !== "" && !msg.prefix.endsWith("/")) {
+          send(conn, {
+            op: "error",
+            message: "Prefix must end with '/' or be empty string",
+          });
+          break;
+        }
+        if (msg.prefix.startsWith(META)) {
+          send(conn, { op: "error", message: "Reserved key prefix" });
+          break;
+        }
+        subs.prefixes.set(msg.prefix, { includeSelf: msg.includeSelf === true });
+        break;
+      }
+
+      case "unsubscribe_key": {
+        this.subscriptions.get(conn.id)?.keys.delete(msg.key);
+        break;
+      }
+
+      case "unsubscribe_prefix": {
+        this.subscriptions.get(conn.id)?.prefixes.delete(msg.prefix);
         break;
       }
 
@@ -409,7 +554,7 @@ export default class RoomServer implements Party.Server {
           channel: msg.channel,
           data: msg.data,
         };
-        // Exclude sender — consistent with subscribe change fanout.
+        // Exclude sender — consistent with subscribe change fanout default.
         this.party.broadcast(JSON.stringify(broadcastMsg), [conn.id]);
         break;
       }
@@ -472,17 +617,17 @@ export default class RoomServer implements Party.Server {
     switch (action.op) {
       case "set":
         await this.store.set(action.key, action.value);
-        this.notifySubscribers(action.key, action.value, "");
+        this.notifySet(action.key, action.value, null);
         break;
       case "delete":
         await this.store.delete(action.key);
-        this.notifySubscribers(action.key, null, "", true);
+        this.notifyDelete(action.key, null);
         break;
       case "increment": {
         const current = await this.store.get(action.key);
         const next = (typeof current === "number" ? current : 0) + (action.delta ?? 1);
         await this.store.set(action.key, next);
-        this.notifySubscribers(action.key, next, "");
+        this.notifySet(action.key, next, null);
         break;
       }
       case "broadcast":
@@ -493,10 +638,10 @@ export default class RoomServer implements Party.Server {
     }
   }
 
-  // ── List helper ─────────────────────────────────────────────────────────────
+  // ── List helpers ────────────────────────────────────────────────────────────
 
   // Fetches user-visible keys, skipping internal __rs/ entries.
-  // If a page is entirely internal keys, fetches the next page (up to 5 times)
+  // If a page is entirely internal keys, fetches the next page (up to 20 times)
   // so callers always get either user data or a definitive empty result.
   private async listUserKeys(
     prefix: string,
@@ -507,39 +652,93 @@ export default class RoomServer implements Party.Server {
     let nextCursor: string | undefined;
     let fetchCursor = cursor;
 
-    // META_SKIP is the first key lexicographically past all "__rs/" entries.
-    // "/" is char 47; char 48 is "0". Used to jump the cursor in one step
-    // rather than paging through potentially hundreds of internal keys.
-    const META_SKIP = META.slice(0, -1) + String.fromCharCode(META.charCodeAt(META.length - 1) + 1);
+    const META_SKIP =
+      META.slice(0, -1) + String.fromCharCode(META.charCodeAt(META.length - 1) + 1);
 
     for (let i = 0; i < 20; i++) {
       const page = await this.store.list(prefix, limit, fetchCursor);
       let pageHadUserKeys = false;
       for (const [k, v] of Object.entries(page.entries)) {
-        if (!k.startsWith(META)) { entries[k] = v; pageHadUserKeys = true; }
+        if (!k.startsWith(META)) {
+          entries[k] = v;
+          pageHadUserKeys = true;
+        }
       }
       nextCursor = page.nextCursor;
       const userCount = Object.keys(entries).length;
       if (!nextCursor || (limit !== undefined && userCount >= limit)) break;
-      // If the whole page was internal keys, jump past the internal namespace
-      // in one step instead of paging through every internal entry.
       fetchCursor = (!pageHadUserKeys && nextCursor.startsWith(META))
         ? META_SKIP
         : nextCursor;
     }
 
-    // Trim if a page boundary caused overshoot beyond limit.
     if (limit) {
       const keys = Object.keys(entries);
       if (keys.length > limit) {
         const trimmed: Record<string, unknown> = {};
         for (const k of keys.slice(0, limit)) trimmed[k] = entries[k];
-        // Use the last included key as nextCursor so the next page starts after it.
         return { entries: trimmed, nextCursor: keys[limit - 1] };
       }
     }
 
     return { entries, nextCursor };
+  }
+
+  // Fetches every user-visible key under a prefix in a single call. Used by
+  // snapshot — bounded by a safety cap to prevent runaway memory use.
+  private async collectAllUserKeys(prefix: string): Promise<Record<string, unknown>> {
+    const out: Record<string, unknown> = {};
+    let cursor: string | undefined;
+    const HARD_CAP = 10_000;
+
+    while (true) {
+      const page = await this.listUserKeys(prefix, 128, cursor);
+      Object.assign(out, page.entries);
+      if (!page.nextCursor) break;
+      cursor = page.nextCursor;
+      if (Object.keys(out).length >= HARD_CAP) break;
+    }
+    return out;
+  }
+
+  // Walks every user-visible key under a prefix and deletes it. Returns the
+  // count. Reschedules the alarm once at the end rather than per-key.
+  private async deletePrefix(prefix: string, sourceConnId: string): Promise<number> {
+    const META_SKIP =
+      META.slice(0, -1) + String.fromCharCode(META.charCodeAt(META.length - 1) + 1);
+
+    let count = 0;
+    let cursor: string | undefined;
+    let touchedAnyTTL = false;
+    const dos = this.party.storage as unknown as DurableObjectStorage;
+
+    while (true) {
+      const page = await this.store.list(prefix, 128, cursor);
+      let pageHadUserKeys = false;
+      const keys = Object.keys(page.entries);
+
+      for (const k of keys) {
+        if (k.startsWith(META)) continue;
+        pageHadUserKeys = true;
+        await this.store.delete(k);
+        // Per-key TTL cleanup, reschedule once at the end.
+        const had = await dos.get(`${META}ttl/${k}`);
+        if (had !== undefined) {
+          await dos.delete(`${META}ttl/${k}`);
+          touchedAnyTTL = true;
+        }
+        this.notifyDelete(k, sourceConnId);
+        count++;
+      }
+
+      if (!page.nextCursor) break;
+      cursor = (!pageHadUserKeys && page.nextCursor.startsWith(META))
+        ? META_SKIP
+        : page.nextCursor;
+    }
+
+    if (touchedAnyTTL) await this.rescheduleNextAlarm(dos);
+    return count;
   }
 
   // ── TTL helpers ─────────────────────────────────────────────────────────────
@@ -556,7 +755,6 @@ export default class RoomServer implements Party.Server {
 
     const pick = (t: number) => { next = next === null ? t : Math.min(next, t); };
 
-    // Paginate — DO storage list() returns max 128 entries per call.
     let ttlCursor: string | undefined;
     do {
       const ttlPage = await dos.list<number>({ prefix: `${META}ttl/`, startAfter: ttlCursor });
@@ -568,7 +766,6 @@ export default class RoomServer implements Party.Server {
     } while (true);
 
     const fireAt = await dos.get<number>(`${META}alarm/fireAt`);
-    // Clamp to at least now+1 so delay=0 alarms are always scheduled.
     if (fireAt) pick(Math.max(fireAt, now + 1));
 
     const rec = await dos.get<{ nextAt?: number }>(`${META}alarm/recurring`);
@@ -587,13 +784,13 @@ export default class RoomServer implements Party.Server {
     }
   }
 
-  private async getWithTTLCheck(key: string, sourceConnId = ""): Promise<unknown> {
+  private async getWithTTLCheck(key: string, sourceConnId: string | null): Promise<unknown> {
     const dos = this.party.storage as unknown as DurableObjectStorage;
     const expiresAt = await dos.get<number>(`${META}ttl/${key}`);
     if (expiresAt !== undefined && expiresAt <= Date.now()) {
       await this.store.delete(key);
       await dos.delete(`${META}ttl/${key}`);
-      this.notifySubscribers(key, null, sourceConnId, true);
+      this.notifyDelete(key, sourceConnId);
       return null;
     }
     return this.store.get(key);
@@ -601,47 +798,117 @@ export default class RoomServer implements Party.Server {
 
   // ── Subscription fanout ─────────────────────────────────────────────────────
 
-  private notifySubscribers(
-    key: string,
-    value: unknown,
-    sourceConnId: string,
-    deleted = false
-  ) {
-    const changeMsg: ServerMsg = { op: "change", key, value, deleted };
-    const payload = JSON.stringify(changeMsg);
+  private notifySet(key: string, value: unknown, originConnId: string | null) {
+    this.fanout(key, originConnId, {
+      op: "change",
+      type: "set",
+      key,
+      value,
+      originConnId,
+    });
+  }
 
-    for (const [connId, prefixes] of this.subscriptions) {
-      if (connId === sourceConnId) continue;
-      for (const prefix of prefixes) {
-        if (key.startsWith(prefix)) {
-          this.party.getConnection(connId)?.send(payload);
-          break;
+  private notifyDelete(key: string, originConnId: string | null) {
+    this.fanout(key, originConnId, {
+      op: "change",
+      type: "delete",
+      key,
+      originConnId,
+    });
+  }
+
+  // Walks all connections and dispatches `change` to those whose subscription
+  // matches `key`. A connection that originated the change only receives it if
+  // at least one matching sub has `includeSelf: true`.
+  private fanout(key: string, sourceConnId: string | null, msg: ServerMsg) {
+    let payload: string | null = null;
+
+    for (const [connId, subs] of this.subscriptions) {
+      const isSource = sourceConnId !== null && connId === sourceConnId;
+
+      let matched = false;
+      let includeSelf = false;
+
+      const exact = subs.keys.get(key);
+      if (exact) {
+        matched = true;
+        if (exact.includeSelf) includeSelf = true;
+      }
+      if (!includeSelf) {
+        for (const [prefix, sub] of subs.prefixes) {
+          if (key.startsWith(prefix)) {
+            matched = true;
+            if (sub.includeSelf) {
+              includeSelf = true;
+              break;
+            }
+          }
         }
       }
+
+      if (!matched) continue;
+      if (isSource && !includeSelf) continue;
+
+      payload ??= JSON.stringify(msg);
+      this.party.getConnection(connId)?.send(payload);
     }
   }
 
   // ── Rate limiting ───────────────────────────────────────────────────────────
-  private checkRateLimit(connId: string): boolean {
+
+  private checkRateLimit(connId: string): RateCheckResult {
     return this.rateCheck(this.rateLimits, connId);
   }
 
-  private checkHttpRateLimit(apiKey: string): boolean {
+  private checkHttpRateLimit(apiKey: string): RateCheckResult {
     return this.rateCheck(this.httpRateLimits, apiKey);
   }
 
   private rateCheck(
-    map: Map<string, { count: number; windowStart: number }>,
+    map: Map<string, RateBucket>,
     key: string
-  ): boolean {
+  ): RateCheckResult {
     const now = Date.now();
+    const limit = this.rateLimitOps;
+    const window = this.rateLimitWindowMs;
     const existing = map.get(key);
-    if (!existing || now - existing.windowStart > this.rateLimitWindowMs) {
-      map.set(key, { count: 1, windowStart: now });
-      return true;
+
+    if (!existing || now - existing.windowStart > window) {
+      map.set(key, { count: 1, windowStart: now, warned: false });
+      return {
+        allowed: true,
+        limit,
+        window,
+        remaining: limit - 1,
+        resetAt: now + window,
+      };
     }
+
     existing.count++;
-    return existing.count <= this.rateLimitOps;
+    return {
+      allowed: existing.count <= limit,
+      limit,
+      window,
+      remaining: Math.max(0, limit - existing.count),
+      resetAt: existing.windowStart + window,
+    };
+  }
+
+  // Push a one-time `rate_limit_warning` per window once usage crosses 80%.
+  private maybeWarnRateLimit(
+    conn: Party.Connection,
+    connId: string,
+    rate: RateCheckResult
+  ) {
+    const bucket = this.rateLimits.get(connId);
+    if (!bucket || bucket.warned) return;
+    if (rate.remaining / rate.limit > 0.2) return;
+    bucket.warned = true;
+    send(conn, {
+      op: "rate_limit_warning",
+      remaining: rate.remaining,
+      resetAt: rate.resetAt,
+    });
   }
 
   // ── Auth ────────────────────────────────────────────────────────────────────
@@ -689,6 +956,14 @@ export default class RoomServer implements Party.Server {
 
 function send(conn: Party.Connection, msg: ServerMsg) {
   conn.send(JSON.stringify(msg));
+}
+
+function emptyConnSubs(): ConnSubs {
+  return { keys: new Map(), prefixes: new Map() };
+}
+
+function toRateLimitInfo(r: RateCheckResult): RateLimitInfo {
+  return { limit: r.limit, window: r.window, remaining: r.remaining, resetAt: r.resetAt };
 }
 
 function deepEqual(a: unknown, b: unknown): boolean {

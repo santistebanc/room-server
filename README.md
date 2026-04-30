@@ -2,6 +2,8 @@
 
 A generic PartyKit backend. Any app can connect and get real-time key-value storage, subscriptions, atomic ops, presence, broadcast, and scheduled jobs — with no server code to write.
 
+> **Breaking changes since the previous release.** The subscribe API was redesigned, the `change` event shape is now a discriminated union, and the wire protocol gained `originConnId`, new ops (`touch`, `delete_prefix`, `snapshot`), and rate-limit telemetry. See "Migration notes" at the bottom for details.
+
 ## Deploy the server
 
 **1. Clone and install**
@@ -60,12 +62,12 @@ const room = new RoomClient({
   },
 });
 
-await room.ready();           // resolves once server handshake completes
+await room.ready();           // resolves once first server handshake completes
 ```
 
 Each unique `roomId` is a fully isolated namespace. Different `apiKey` values are always isolated from each other — two apps cannot access each other's rooms.
 
-The client automatically reconnects on disconnect and restores all subscriptions and in-flight operations.
+The client automatically reconnects on disconnect and restores all subscriptions and in-flight operations. Use `room.status` and `room.on("status", ...)` to observe the connection lifecycle (see below).
 
 ---
 
@@ -128,32 +130,89 @@ const { success, current } = await room.setIf("lock", "mine", null);
 // success = true if key was null (unset), false if already held by someone else
 ```
 
-### `room.subscribe(prefix, handler)` → `unsubscribe()`
+### `room.touch(key, { ttl })` → `Promise<void>`
 
-Receive real-time changes from other connected clients whenever a matching key is set or deleted.
+Refresh the TTL on an existing key without rewriting its value. Errors if the key does not exist or is `null`.
 
 ```ts
-const unsub = room.subscribe("users/", (key, value, deleted) => {
-  if (deleted) removeUser(key);
-  else updateUser(key, value);
-});
-
-unsub(); // stop listening
+await room.touch("session/abc", { ttl: 3600 }); // reset to 1h from now
 ```
 
-The subscribing client does **not** receive its own changes.
+### `room.deletePrefix(prefix)` → `Promise<{ deleted: number }>`
 
-Subscribe to `"presence/"` to track who is online — the server automatically manages `presence/{connectionId}` entries on connect and disconnect.
+Atomically delete every key under a prefix. Subscribers receive one `delete` event per key.
 
 ```ts
-// Get current online users immediately, then watch for changes.
-const { entries } = await room.list("presence/");
-const online = new Map(Object.entries(entries));
+const { deleted } = await room.deletePrefix("votes/");
+```
 
-room.subscribe("presence/", (key, value, deleted) => {
-  if (deleted) online.delete(key);
-  else online.set(key, value);
-  console.log("online:", [...online.keys()]);
+The empty prefix and reserved prefixes (`__rs/`, `presence/`) are rejected.
+
+### `room.snapshot({ keys?, prefixes? })` → `Promise<{ keys, prefixes }>`
+
+Read several keys and/or prefixes in a single round trip. Useful for hydrating UI on first load without N separate fetches.
+
+```ts
+const snap = await room.snapshot({
+  keys: ["meta", "settings"],
+  prefixes: ["users/", "votes/"],
+});
+// snap.keys.meta, snap.keys.settings
+// snap.prefixes["users/"]  — Record<string, unknown>
+// snap.prefixes["votes/"]
+```
+
+Each prefix is bounded at 10,000 entries. For larger sets, use `list()` with pagination.
+
+### `room.subscribeKey(key, handler, opts?)` → `unsubscribe()`
+
+Receive real-time changes for a single exact key.
+
+```ts
+const unsub = room.subscribeKey("meta", (event) => {
+  if (event.type === "delete") clearMeta();
+  else applyMeta(event.value);
+});
+```
+
+### `room.subscribePrefix(prefix, handler, opts?)` → `unsubscribe()`
+
+Receive real-time changes for any key starting with `prefix`. The prefix must end with `"/"` or be the empty string (which matches everything).
+
+```ts
+room.subscribePrefix("users/", (event) => {
+  if (event.type === "delete") removeUser(event.key);
+  else                         updateUser(event.key, event.value);
+});
+```
+
+Both subscribe methods accept `{ includeSelf: true }` to also receive changes originated by this client. By default, the subscribing client does **not** receive its own writes.
+
+```ts
+room.subscribePrefix("votes/", handler, { includeSelf: true });
+```
+
+### `ChangeEvent`
+
+```ts
+type ChangeEvent =
+  | { type: "set";    key: string; value: unknown; originConnId: string | null }
+  | { type: "delete"; key: string;                  originConnId: string | null };
+```
+
+`originConnId` identifies the connection that originated the change. It is `null` for HTTP, alarm-driven, and TTL-sweep changes. Compare with `room.connectionId` to detect self-writes.
+
+### Presence
+
+The server automatically manages `presence/{connectionId}` entries on connect and disconnect. Subscribe to `"presence/"` to track who is online.
+
+```ts
+const snap = await room.snapshot({ prefixes: ["presence/"] });
+const online = new Map(Object.entries(snap.prefixes["presence/"]));
+
+room.subscribePrefix("presence/", (event) => {
+  if (event.type === "delete") online.delete(event.key);
+  else                         online.set(event.key, event.value);
 });
 ```
 
@@ -175,7 +234,51 @@ const unsub = room.onBroadcast("chat", (data) => {
 
 ### `room.disconnect()`
 
-Close the WebSocket connection.
+Close the WebSocket connection immediately. Pending operations are rejected.
+
+### `room.flushAndDisconnect(timeoutMs?)` → `Promise<void>`
+
+Wait for in-flight operations to settle (or the timeout, default 5s) before closing. Useful in `beforeunload` handlers to make sure the user's last write actually lands.
+
+```ts
+window.addEventListener("beforeunload", () => {
+  room.flushAndDisconnect();
+});
+```
+
+---
+
+## Connection lifecycle
+
+`room.status` is one of `"connecting" | "ready" | "reconnecting" | "closed"`.
+
+```ts
+room.status                 // current state
+room.connectionId           // string once "ready", null otherwise
+
+const off = room.on("status", (s) => {
+  document.getElementById("badge")!.textContent = s;
+});
+off(); // stop listening
+```
+
+Subscriptions and in-flight ops are automatically restored when the socket reconnects. While reconnecting, new ops are queued and replayed on reconnect.
+
+### Rate-limit telemetry
+
+```ts
+room.on("rateLimit", ({ remaining, resetAt }) => {
+  console.warn(`rate limit at 80% — ${remaining} ops left until ${new Date(resetAt)}`);
+});
+```
+
+When a request is denied, the rejected promise is a `RoomError` with an optional `rateLimit` field carrying `{ limit, window, remaining, resetAt }`.
+
+### Debug logging
+
+```ts
+room.debug = true; // logs every send/recv and ws lifecycle event to the console
+```
 
 ---
 
@@ -329,19 +432,24 @@ ws://localhost:1999/parties/room/{apiKey}:{roomId}?apiKey=<key>&persistence=stor
 **Client → Server**
 
 ```jsonc
-{ "op": "set",         "key": "k", "value": <any>, "ttl": 60,        "requestId": "abc" }
-{ "op": "get",         "key": "k",                                    "requestId": "abc" }
-{ "op": "delete",      "key": "k",                                    "requestId": "abc" }
-{ "op": "list",        "prefix": "users/", "limit": 10, "cursor": "…","requestId": "abc" }
-{ "op": "increment",   "key": "k", "delta": 1,                        "requestId": "abc" }
-{ "op": "set_if",      "key": "k", "value": <any>, "ifValue": <any>,  "requestId": "abc" }
-{ "op": "subscribe",        "prefix": "users/" }
-{ "op": "unsubscribe",      "prefix": "users/" }
-{ "op": "broadcast",        "channel": "chat", "data": <any> }
-{ "op": "schedule_alarm",   "delay": 60, "action": <AlarmAction>,          "requestId": "abc" }
-{ "op": "cancel_alarm",                                                     "requestId": "abc" }
-{ "op": "schedule_recurring","interval": 60, "action": <AlarmAction>,      "requestId": "abc" }
-{ "op": "cancel_recurring",                                                 "requestId": "abc" }
+{ "op": "set",                "key": "k", "value": <any>, "ttl": 60,           "requestId": "abc" }
+{ "op": "get",                "key": "k",                                       "requestId": "abc" }
+{ "op": "delete",             "key": "k",                                       "requestId": "abc" }
+{ "op": "list",               "prefix": "users/", "limit": 10, "cursor": "…",   "requestId": "abc" }
+{ "op": "increment",          "key": "k", "delta": 1,                           "requestId": "abc" }
+{ "op": "set_if",             "key": "k", "value": <any>, "ifValue": <any>,     "requestId": "abc" }
+{ "op": "touch",              "key": "k", "ttl": 60,                            "requestId": "abc" }
+{ "op": "delete_prefix",      "prefix": "votes/",                               "requestId": "abc" }
+{ "op": "snapshot",           "keys": ["…"], "prefixes": ["…/"],                "requestId": "abc" }
+{ "op": "subscribe_key",      "key": "meta",      "includeSelf": false }
+{ "op": "subscribe_prefix",   "prefix": "users/", "includeSelf": false }
+{ "op": "unsubscribe_key",    "key": "meta" }
+{ "op": "unsubscribe_prefix", "prefix": "users/" }
+{ "op": "broadcast",          "channel": "chat", "data": <any> }
+{ "op": "schedule_alarm",     "delay": 60, "action": <AlarmAction>,             "requestId": "abc" }
+{ "op": "cancel_alarm",                                                          "requestId": "abc" }
+{ "op": "schedule_recurring", "interval": 60, "action": <AlarmAction>,          "requestId": "abc" }
+{ "op": "cancel_recurring",                                                      "requestId": "abc" }
 ```
 
 Where `AlarmAction` is one of:
@@ -356,12 +464,31 @@ Where `AlarmAction` is one of:
 **Server → Client**
 
 ```jsonc
-{ "op": "ready",         "persistence": "storage", "appId": "key-app1", "roomId": "my-room" }
-{ "op": "ack",           "requestId": "abc" }
-{ "op": "result",        "requestId": "abc", "key": "k", "value": <any> }
-{ "op": "list_result",   "requestId": "abc", "prefix": "users/", "entries": {…}, "nextCursor": "…" }
-{ "op": "set_if_result", "requestId": "abc", "success": true, "current": <any> }
-{ "op": "change",        "key": "k", "value": <any>, "deleted": false }
-{ "op": "broadcast_recv","channel": "chat", "data": <any> }
-{ "op": "error",         "requestId": "abc", "message": "…" }
+{ "op": "ready",                "persistence": "storage", "appId": "key-app1", "roomId": "my-room", "connectionId": "…" }
+{ "op": "ack",                  "requestId": "abc" }
+{ "op": "result",               "requestId": "abc", "key": "k", "value": <any> }
+{ "op": "list_result",          "requestId": "abc", "prefix": "users/", "entries": {…}, "nextCursor": "…" }
+{ "op": "set_if_result",        "requestId": "abc", "success": true, "current": <any> }
+{ "op": "delete_prefix_result", "requestId": "abc", "deleted": 12 }
+{ "op": "snapshot_result",      "requestId": "abc", "keys": {…}, "prefixes": { "users/": {…} } }
+{ "op": "change",               "type": "set",    "key": "k", "value": <any>, "originConnId": "conn-id" | null }
+{ "op": "change",               "type": "delete", "key": "k",                  "originConnId": "conn-id" | null }
+{ "op": "broadcast_recv",       "channel": "chat", "data": <any> }
+{ "op": "rate_limit_warning",   "remaining": 17, "resetAt": 1714500000000 }
+{ "op": "error",                "requestId": "abc", "message": "…", "rateLimit": { "limit": 100, "window": 10000, "remaining": 0, "resetAt": 1714500000000 } }
 ```
+
+`originConnId` is `null` for HTTP, alarm-driven, and TTL-sweep changes. The `rateLimit` field on `error` is only set when the error was caused by rate limiting.
+
+---
+
+## Migration notes
+
+If you're upgrading from a previous release:
+
+- `room.subscribe(prefix, (key, value, deleted) => …)` is replaced by `room.subscribeKey(key, handler)` and `room.subscribePrefix(prefix, handler)`. Handlers now receive a single `ChangeEvent` discriminated union: `{ type: "set", key, value, originConnId }` or `{ type: "delete", key, originConnId }`. `subscribePrefix` requires the prefix to end with `"/"` or be the empty string.
+- The wire `change` message gained `type: "set" | "delete"` and `originConnId` and dropped the `deleted` flag.
+- `ready` messages now carry `connectionId`.
+- New ops: `touch`, `delete_prefix`, `snapshot`. New client methods: `room.touch`, `room.deletePrefix`, `room.snapshot`, `room.flushAndDisconnect`, `room.on`, `room.status`, `room.connectionId`, `room.debug`.
+- `error` responses gained an optional `rateLimit` field; the server now also pushes a `rate_limit_warning` once per window when usage crosses 80%.
+- For unit tests, a `room-server/mock` entry point exposes `MockRoomClient` (in-memory, no socket) and `resetMockRooms()`.

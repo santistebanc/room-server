@@ -50,13 +50,45 @@ export interface SetIfMsg {
   requestId?: string;
 }
 
-export interface SubscribeMsg {
-  op: "subscribe";
-  prefix: string;
+export interface TouchMsg {
+  op: "touch";
+  key: string;
+  ttl: number; // seconds from now; replaces any existing TTL on the key
+  requestId?: string;
 }
 
-export interface UnsubscribeMsg {
-  op: "unsubscribe";
+export interface DeletePrefixMsg {
+  op: "delete_prefix";
+  prefix: string;
+  requestId?: string;
+}
+
+export interface SnapshotMsg {
+  op: "snapshot";
+  keys?: string[];
+  prefixes?: string[];
+  requestId?: string;
+}
+
+export interface SubscribeKeyMsg {
+  op: "subscribe_key";
+  key: string;
+  includeSelf?: boolean;
+}
+
+export interface SubscribePrefixMsg {
+  op: "subscribe_prefix";
+  prefix: string;
+  includeSelf?: boolean;
+}
+
+export interface UnsubscribeKeyMsg {
+  op: "unsubscribe_key";
+  key: string;
+}
+
+export interface UnsubscribePrefixMsg {
+  op: "unsubscribe_prefix";
   prefix: string;
 }
 
@@ -104,8 +136,13 @@ export type ClientMsg =
   | ListMsg
   | IncrementMsg
   | SetIfMsg
-  | SubscribeMsg
-  | UnsubscribeMsg
+  | TouchMsg
+  | DeletePrefixMsg
+  | SnapshotMsg
+  | SubscribeKeyMsg
+  | SubscribePrefixMsg
+  | UnsubscribeKeyMsg
+  | UnsubscribePrefixMsg
   | BroadcastMsg
   | ScheduleAlarmMsg
   | CancelAlarmMsg
@@ -119,6 +156,7 @@ export interface ReadyMsg {
   persistence: PersistenceLevel;
   appId: string;
   roomId: string;
+  connectionId: string;
 }
 
 export interface ResultMsg {
@@ -143,12 +181,35 @@ export interface SetIfResultMsg {
   current: unknown;
 }
 
-export interface ChangeMsg {
-  op: "change";
-  key: string;
-  value: unknown;
-  deleted?: boolean;
+export interface DeletePrefixResultMsg {
+  op: "delete_prefix_result";
+  requestId?: string;
+  deleted: number;
 }
+
+export interface SnapshotResultMsg {
+  op: "snapshot_result";
+  requestId?: string;
+  keys: Record<string, unknown>;
+  prefixes: Record<string, Record<string, unknown>>;
+}
+
+export type ChangeMsg =
+  | {
+      op: "change";
+      type: "set";
+      key: string;
+      value: unknown;
+      // Connection that originated the write. `null` for HTTP, alarm-driven,
+      // and TTL-sweep changes.
+      originConnId: string | null;
+    }
+  | {
+      op: "change";
+      type: "delete";
+      key: string;
+      originConnId: string | null;
+    };
 
 export interface BroadcastRecvMsg {
   op: "broadcast_recv";
@@ -156,10 +217,24 @@ export interface BroadcastRecvMsg {
   data: unknown;
 }
 
+export interface RateLimitInfo {
+  limit: number;       // max ops per window
+  window: number;      // window size in milliseconds
+  remaining: number;   // ops left in current window
+  resetAt: number;     // epoch ms when the current window resets
+}
+
 export interface ErrorMsg {
   op: "error";
   requestId?: string;
   message: string;
+  rateLimit?: RateLimitInfo;
+}
+
+export interface RateLimitWarningMsg {
+  op: "rate_limit_warning";
+  remaining: number;
+  resetAt: number;
 }
 
 export interface AckMsg {
@@ -172,9 +247,12 @@ export type ServerMsg =
   | ResultMsg
   | ListResultMsg
   | SetIfResultMsg
+  | DeletePrefixResultMsg
+  | SnapshotResultMsg
   | ChangeMsg
   | BroadcastRecvMsg
   | ErrorMsg
+  | RateLimitWarningMsg
   | AckMsg;
 
 // ── Misc ──────────────────────────────────────────────────────────────────────
@@ -182,6 +260,11 @@ export type ServerMsg =
 export interface ListResult {
   entries: Record<string, unknown>;
   nextCursor?: string;
+}
+
+export interface SnapshotResult {
+  keys: Record<string, unknown>;
+  prefixes: Record<string, Record<string, unknown>>;
 }
 
 export interface PresenceInfo {

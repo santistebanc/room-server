@@ -48,16 +48,17 @@ connectBtn.addEventListener("click", async () => {
 
   client = new RoomClient({ host, roomId, config: { apiKey, persistence } });
 
-  // Subscribe to all keys so we see changes from other clients.
-  client.subscribe("", (key, value, deleted) => {
-    if (deleted) {
-      kvStore.delete(key);
+  // Subscribe to all keys, including our own writes — the server is the single
+  // source of truth; we never write to the local mirror directly.
+  client.subscribePrefix("", (e) => {
+    if (e.type === "delete") {
+      kvStore.delete(e.key);
     } else {
-      kvStore.set(key, value);
+      kvStore.set(e.key, e.value);
     }
     renderKv();
-    flashEntry(key);
-  });
+    flashEntry(e.key);
+  }, { includeSelf: true });
 
   // Receive chat messages.
   client.onBroadcast("chat", (data) => {
@@ -75,8 +76,8 @@ connectBtn.addEventListener("click", async () => {
   }
 
   // Hydrate local mirror from server.
-  const existing = (await client.list("")) as Record<string, unknown>;
-  for (const [k, v] of Object.entries(existing)) kvStore.set(k, v);
+  const existing = await client.list("");
+  for (const [k, v] of Object.entries(existing.entries)) kvStore.set(k, v);
   renderKv();
 
   setStatus(true);
@@ -119,8 +120,6 @@ async function kvSet() {
   }
 
   await client.set(key, value);
-  kvStore.set(key, value);
-  renderKv();
   inpKvKey.value = "";
   inpKvValue.value = "";
 }
@@ -128,8 +127,6 @@ async function kvSet() {
 async function kvDelete(key: string) {
   if (!client) return;
   await client.delete(key);
-  kvStore.delete(key);
-  renderKv();
 }
 
 // ── KV render ─────────────────────────────────────────────────────────────────
