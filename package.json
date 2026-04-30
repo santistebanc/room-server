@@ -1,6 +1,6 @@
 {
   "name": "room-server",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "Generic PartyKit backend — real-time KV, subscriptions, presence, and broadcast for any app.",
   "main": "dist/server.js",
   "types": "dist/server.d.ts",

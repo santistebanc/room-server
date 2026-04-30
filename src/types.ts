@@ -18,6 +18,13 @@ export interface AuthMsg {
   apiKey: string;
   userId?: string;
   persistence?: PersistenceLevel;
+  /**
+   * Optional client-known schema version. When omitted, server returns its
+   * current `schemaVersion` in `ready` and the client may follow up with
+   * `register_schemas` if needed. When provided, the client signals "I know
+   * version N is current" and the SDK can fast-path schema registration.
+   */
+  schemaVersion?: number;
   requestId?: string;
 }
 
@@ -73,6 +80,8 @@ export interface SetIfMsg {
    * existed. Mutually exclusive with `ifValue`.
    */
   ifRev?: number;
+  /** Optional TTL in seconds applied on successful write (cleared on failure). */
+  ttl?: number;
   requestId?: string;
 }
 
@@ -117,6 +126,7 @@ export type TransactOp =
       value: unknown;
       ifValue?: unknown;
       ifRev?: number;
+      ttl?: number;
     };
 
 export interface SubscribeKeyMsg {
@@ -186,6 +196,13 @@ export interface RegisterSchemasMsg {
   schemas: Record<string, JsonSchema>;
   /** If true, replaces existing schema registry; otherwise merges. Default: false. */
   replace?: boolean;
+  /**
+   * Monotonic version tag. When provided, the server only accepts the
+   * registration if `version > currentSchemaVersion`. Stale registrations are
+   * rejected with `kind: "schemaConflict"`. When omitted, the registration
+   * always overwrites (legacy behavior).
+   */
+  version?: number;
   requestId?: string;
 }
 
@@ -254,6 +271,12 @@ export interface ReadyMsg {
   appId: string;
   roomId: string;
   connectionId: string;
+  /**
+   * Current schema version stored in the room. `0` means no versioned schemas
+   * have ever been registered. Clients use this to decide whether their local
+   * schema version warrants a follow-up `register_schemas`.
+   */
+  schemaVersion: number;
 }
 
 export interface ResultMsg {
@@ -380,6 +403,8 @@ export interface SchemasRegisteredMsg {
   op: "schemas_registered";
   requestId?: string;
   count: number;
+  /** The new current version after this registration. */
+  schemaVersion: number;
 }
 
 export interface RateLimitInfo {
@@ -395,16 +420,44 @@ export interface ValidationErrorDetail {
   message: string;
 }
 
+/**
+ * Discriminator for `RoomError` and `ErrorMsg`. Consumers should `switch` on
+ * `kind` rather than testing which optional field happens to be set.
+ *
+ *  - `validation`     — server-side schema rejection (carries `validationError`)
+ *  - `rateLimit`      — throttled (carries `rateLimit`)
+ *  - `auth`           — auth handshake failed
+ *  - `schemaConflict` — `register_schemas` rejected because `version <= current`
+ *  - `transient`      — socket closed, ready timeout, op disconnected before settle
+ *  - `invalid`        — client-side bad usage (reserved prefix, bad opts, …)
+ *  - `unknown`        — catch-all for unmapped server errors
+ */
+export type RoomErrorKind =
+  | "validation"
+  | "rateLimit"
+  | "auth"
+  | "schemaConflict"
+  | "transient"
+  | "invalid"
+  | "unknown";
+
 export interface ErrorMsg {
   op: "error";
   requestId?: string;
   message: string;
+  /** Discriminator. Older servers may omit this; clients should default to "unknown". */
+  kind?: RoomErrorKind;
   rateLimit?: RateLimitInfo;
   /** Populated when the error was caused by schema validation. */
   validationError?: {
     key: string;
     schemaPattern: string;
     errors: ValidationErrorDetail[];
+  };
+  /** Populated when `register_schemas` was rejected by version. */
+  schemaConflict?: {
+    incomingVersion: number;
+    currentVersion: number;
   };
 }
 

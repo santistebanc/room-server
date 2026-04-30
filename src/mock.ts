@@ -19,7 +19,10 @@ import {
   type IncrementResult,
   type InitialKeySnapshot,
   type InitialPrefixSnapshot,
+  type ResolveKey,
   type RoomClientEvents,
+  type RoomSchemaMap,
+  type RoomSchemasConfig,
   type SetIfOptions,
   type SetIfResult,
   type SetOptions,
@@ -30,6 +33,7 @@ import {
   type SubscribeWithSnapshotKeyResult,
   type SubscribeWithSnapshotPrefixResult,
   type TransactResult,
+  type TypedChangeEvent,
   type UnsubscribeFn,
 } from "./client.js";
 import type {
@@ -80,6 +84,7 @@ class MockRoom {
   store = new MemoryStore();
   revs = new Map<string, number>();
   schemas: Record<string, JsonSchema> = {};
+  schemaVersion = 0;
   connections = new Set<MockConn>();
   ttlTimers = new Map<string, ReturnType<typeof setTimeout>>();
   alarm: OneShotAlarm | null = null;
@@ -269,15 +274,18 @@ let connCounter = 0;
 export interface MockRoomClientOptions {
   roomId: string;
   config: ConnectConfig;
-  schemas?: ClientSchemaMap;
+  schemas?: RoomSchemasConfig;
   /** Ignored — accepted so the constructor signature mirrors `RoomClient`. */
   host?: string;
 }
 
-export class MockRoomClient implements IRoomClient {
+export class MockRoomClient<S extends RoomSchemaMap = RoomSchemaMap>
+  implements IRoomClient<S> {
   private room: MockRoom;
   private conn: MockConn;
   private clientSchemas?: ClientSchemaMap;
+  private serverSchemas?: Record<string, JsonSchema>;
+  private localSchemaVersion?: number;
 
   private listeners: { [E in keyof RoomClientEvents]: Set<(p: RoomClientEvents[E]) => void> } = {
     status: new Set(),
@@ -293,7 +301,11 @@ export class MockRoomClient implements IRoomClient {
   constructor(opts: MockRoomClientOptions) {
     const { roomId, config, schemas } = opts;
     this.room = getRoom(config.apiKey, roomId);
-    this.clientSchemas = schemas;
+    if (schemas) {
+      this.clientSchemas = schemas.client;
+      this.serverSchemas = schemas.server;
+      this.localSchemaVersion = schemas.version;
+    }
     this._connectionId = `mock-${++connCounter}`;
     this.conn = {
       id: this._connectionId,
@@ -311,11 +323,28 @@ export class MockRoomClient implements IRoomClient {
       const rev = this.room.bumpRev(presenceKey);
       await this.room.notifyChange("set", presenceKey, presenceValue, rev, this._connectionId);
       this.setStatus("ready");
+      void this.maybeRegisterServerSchemas();
     });
+  }
+
+  private async maybeRegisterServerSchemas() {
+    if (!this.serverSchemas) return;
+    if (this.localSchemaVersion === undefined) return;
+    if (this.localSchemaVersion <= this.room.schemaVersion) return;
+    try {
+      await this.registerSchemas(this.serverSchemas, {
+        replace: true,
+        version: this.localSchemaVersion,
+      });
+    } catch (err) {
+      if (err instanceof RoomError && err.kind === "schemaConflict") return;
+      console.error("[mock] auto-register schemas failed:", err);
+    }
   }
 
   get status(): Status { return this._status; }
   get connectionId(): string | null { return this.closed ? null : this._connectionId; }
+  get schemaVersion(): number | null { return this.closed ? null : this.room.schemaVersion; }
 
   on<E extends keyof RoomClientEvents>(
     event: E,
@@ -337,24 +366,29 @@ export class MockRoomClient implements IRoomClient {
 
   async ready(): Promise<void> {
     if (this._status === "ready") return;
-    if (this._status === "closed") throw new RoomError("Disconnected");
+    if (this._status === "closed") throw new RoomError("Disconnected", { kind: "transient" });
     return new Promise<void>((resolve, reject) => {
       const off = this.on("status", (s) => {
         if (s === "ready") { off(); resolve(); }
-        else if (s === "closed") { off(); reject(new RoomError("Disconnected")); }
+        else if (s === "closed") { off(); reject(new RoomError("Disconnected", { kind: "transient" })); }
       });
     });
   }
 
   // ── CRUD ────────────────────────────────────────────────────────────────────
 
-  async set(key: string, value: unknown, opts?: SetOptions): Promise<SetResult> {
+  async set<K extends string>(
+    key: K,
+    value: ResolveKey<S, K>,
+    opts?: SetOptions
+  ): Promise<SetResult> {
     this.assertOpen();
     this.assertWritable(key);
     await this.maybeValidateLocal(key, value);
     const errs = this.room.validate(key, value);
     if (errs) {
       throw new RoomError(`Validation failed for "${key}"`, {
+        kind: "validation",
         validationError: { key, schemaPattern: errs.schemaPattern, errors: errs.errors },
       });
     }
@@ -366,10 +400,12 @@ export class MockRoomClient implements IRoomClient {
     return { rev };
   }
 
-  async get(key: string): Promise<GetResult> {
+  async get<K extends string>(
+    key: K
+  ): Promise<{ value: ResolveKey<S, K> | null; rev: number }> {
     this.assertOpen();
     if (key.startsWith(META)) return { value: null, rev: 0 };
-    const value = await this.room.store.get(key);
+    const value = (await this.room.store.get(key)) as ResolveKey<S, K> | null;
     return { value, rev: this.room.getRev(key) };
   }
 
@@ -421,11 +457,15 @@ export class MockRoomClient implements IRoomClient {
     return { value: next, rev };
   }
 
-  async setIf(key: string, value: unknown, opts: SetIfOptions): Promise<SetIfResult> {
+  async setIf<K extends string>(
+    key: K,
+    value: ResolveKey<S, K>,
+    opts: SetIfOptions & SetOptions
+  ): Promise<SetIfResult> {
     this.assertOpen();
     this.assertWritable(key);
     if (opts.ifValue !== undefined && opts.ifRev !== undefined) {
-      throw new RoomError("Pass either ifValue or ifRev, not both");
+      throw new RoomError("Pass either ifValue or ifRev, not both", { kind: "invalid" });
     }
     const current = await this.room.store.get(key);
     const currentRev = this.room.getRev(key);
@@ -438,10 +478,13 @@ export class MockRoomClient implements IRoomClient {
       const errs = this.room.validate(key, value);
       if (errs) {
         throw new RoomError(`Validation failed for "${key}"`, {
+          kind: "validation",
           validationError: { key, schemaPattern: errs.schemaPattern, errors: errs.errors },
         });
       }
       await this.room.store.set(key, value);
+      if (opts.ttl) this.room.scheduleTTL(key, opts.ttl);
+      else          this.room.clearTTL(key);
       const rev = this.room.bumpRev(key);
       await this.room.notifyChange("set", key, value, rev, this._connectionId);
       return { success: true, current, rev };
@@ -449,31 +492,39 @@ export class MockRoomClient implements IRoomClient {
     return { success: false, current, rev: currentRev };
   }
 
-  async update<T = unknown>(
-    key: string,
-    fn: (current: T | null) => T
-  ): Promise<{ value: T; rev: number }> {
+  async update<K extends string>(
+    key: K,
+    fn: (current: ResolveKey<S, K> | null) => ResolveKey<S, K>
+  ): Promise<{ value: ResolveKey<S, K>; rev: number }> {
     for (let i = 0; i < 5; i++) {
       const { value, rev } = await this.get(key);
-      const next = fn(value as T | null);
+      const next = fn(value);
       const result = await this.setIf(key, next, { ifRev: rev });
       if (result.success) return { value: next, rev: result.rev };
     }
-    throw new RoomError(`update("${key}") failed after 5 retries`);
+    throw new RoomError(`update("${key}") failed after 5 retries`, { kind: "transient" });
   }
 
-  async reserve(key: string, value: unknown): Promise<boolean> {
-    const result = await this.setIf(key, value, { ifRev: 0 });
+  async reserve<K extends string>(
+    key: K,
+    value: ResolveKey<S, K>,
+    opts?: SetOptions
+  ): Promise<boolean> {
+    const result = await this.setIf(
+      key,
+      value,
+      opts?.ttl !== undefined ? { ifRev: 0, ttl: opts.ttl } : { ifRev: 0 }
+    );
     return result.success;
   }
 
   async touch(key: string, opts: { ttl: number }): Promise<void> {
     this.assertOpen();
     this.assertWritable(key);
-    if (opts.ttl <= 0) throw new RoomError("ttl must be > 0");
+    if (opts.ttl <= 0) throw new RoomError("ttl must be > 0", { kind: "invalid" });
     const current = await this.room.store.get(key);
     if (current === null || current === undefined) {
-      throw new RoomError("Cannot touch key (does not exist or is null)");
+      throw new RoomError("Cannot touch key (does not exist or is null)", { kind: "invalid" });
     }
     this.room.scheduleTTL(key, opts.ttl);
   }
@@ -482,7 +533,8 @@ export class MockRoomClient implements IRoomClient {
     this.assertOpen();
     if (prefix === "" || prefix.startsWith(META) || prefix.startsWith("presence/")) {
       throw new RoomError(
-        prefix === "" ? "delete_prefix requires a non-empty prefix" : "Reserved key prefix"
+        prefix === "" ? "delete_prefix requires a non-empty prefix" : "Reserved key prefix",
+        { kind: "invalid" }
       );
     }
     let deleted = 0;
@@ -519,7 +571,7 @@ export class MockRoomClient implements IRoomClient {
     if (req.prefixes) {
       for (const p of req.prefixes) {
         if (p !== "" && !p.endsWith("/")) {
-          throw new RoomError("Prefix must end with '/' or be empty string");
+          throw new RoomError("Prefix must end with '/' or be empty string", { kind: "invalid" });
         }
         const out: Record<string, unknown> = {};
         let cursor: string | undefined;
@@ -593,6 +645,7 @@ export class MockRoomClient implements IRoomClient {
       const errs = this.room.validate(key, p.value);
       if (errs) {
         throw new RoomError(`Validation failed for "${key}"`, {
+          kind: "validation",
           validationError: { key, schemaPattern: errs.schemaPattern, errors: errs.errors },
         });
       }
@@ -635,6 +688,8 @@ export class MockRoomClient implements IRoomClient {
         case "set_if": {
           const current = await this.room.store.get(op.key);
           await this.room.store.set(op.key, op.value);
+          this.room.clearTTL(op.key);
+          if (op.ttl) this.room.scheduleTTL(op.key, op.ttl);
           const rev = this.room.bumpRev(op.key);
           results.push({ op: "set_if", key: op.key, success: true, current, rev });
           changes.push({ type: "set", key: op.key, value: op.value, rev });
@@ -652,19 +707,35 @@ export class MockRoomClient implements IRoomClient {
 
   async registerSchemas(
     schemas: Record<string, JsonSchema>,
-    opts?: { replace?: boolean }
-  ): Promise<{ count: number }> {
+    opts?: { replace?: boolean; version?: number }
+  ): Promise<{ count: number; schemaVersion: number }> {
     this.assertOpen();
+    if (opts?.version !== undefined && opts.version <= this.room.schemaVersion) {
+      throw new RoomError(
+        `Schema version ${opts.version} <= current ${this.room.schemaVersion}`,
+        {
+          kind: "schemaConflict",
+          schemaConflict: {
+            incomingVersion: opts.version,
+            currentVersion: this.room.schemaVersion,
+          },
+        }
+      );
+    }
     if (opts?.replace) this.room.schemas = { ...schemas };
-    else this.room.schemas = { ...this.room.schemas, ...schemas };
-    return { count: Object.keys(this.room.schemas).length };
+    else                this.room.schemas = { ...this.room.schemas, ...schemas };
+    if (opts?.version !== undefined) this.room.schemaVersion = opts.version;
+    return {
+      count: Object.keys(this.room.schemas).length,
+      schemaVersion: this.room.schemaVersion,
+    };
   }
 
   // ── Scheduled alarms ────────────────────────────────────────────────────────
 
   async scheduleAlarm(delay: number, action?: AlarmAction): Promise<void> {
     this.assertOpen();
-    if (delay < 0) throw new RoomError("delay must be >= 0");
+    if (delay < 0) throw new RoomError("delay must be >= 0", { kind: "invalid" });
     if (this.room.alarm) clearTimeout(this.room.alarm.timer);
     const timer = setTimeout(async () => {
       this.room.alarm = null;
@@ -685,7 +756,7 @@ export class MockRoomClient implements IRoomClient {
 
   async scheduleRecurring(interval: number, action: AlarmAction): Promise<void> {
     this.assertOpen();
-    if (interval <= 0) throw new RoomError("interval must be > 0");
+    if (interval <= 0) throw new RoomError("interval must be > 0", { kind: "invalid" });
     if (this.room.recurring) clearInterval(this.room.recurring.timer);
     const timer = setInterval(async () => {
       try { await this.room.executeAction(action); } catch {}
@@ -703,35 +774,45 @@ export class MockRoomClient implements IRoomClient {
 
   // ── Subscriptions ──────────────────────────────────────────────────────────
 
-  subscribeKey(key: string, handler: ChangeHandler, opts?: SubscribeOptions): UnsubscribeFn {
-    if (key.startsWith(META)) throw new RoomError("Reserved key prefix");
-    return this.addSubscription("key", key, handler, opts);
+  subscribeKey<K extends string>(
+    key: K,
+    handler: (e: TypedChangeEvent<ResolveKey<S, K>>) => void,
+    opts?: SubscribeOptions
+  ): UnsubscribeFn {
+    if (key.startsWith(META)) throw new RoomError("Reserved key prefix", { kind: "invalid" });
+    return this.addSubscription("key", key, handler as ChangeHandler, opts);
   }
 
-  subscribePrefix(prefix: string, handler: ChangeHandler, opts?: SubscribeOptions): UnsubscribeFn {
+  subscribePrefix<K extends string>(
+    prefix: K,
+    handler: (e: TypedChangeEvent<ResolveKey<S, K>>) => void,
+    opts?: SubscribeOptions
+  ): UnsubscribeFn {
     if (prefix !== "" && !prefix.endsWith("/")) {
       throw new Error(
         `room-server: subscribePrefix("${prefix}") requires a trailing "/" or empty string. Use subscribeKey for exact matches.`
       );
     }
-    if (prefix.startsWith(META)) throw new RoomError("Reserved key prefix");
-    return this.addSubscription("prefix", prefix, handler, opts);
+    if (prefix.startsWith(META)) throw new RoomError("Reserved key prefix", { kind: "invalid" });
+    return this.addSubscription("prefix", prefix, handler as ChangeHandler, opts);
   }
 
-  async subscribeWithSnapshotKey(
-    key: string,
-    handler: ChangeHandler,
+  async subscribeWithSnapshotKey<K extends string>(
+    key: K,
+    handler: (e: TypedChangeEvent<ResolveKey<S, K>>) => void,
     opts?: SubscribeOptions
-  ): Promise<SubscribeWithSnapshotKeyResult> {
+  ): Promise<{
+    initial: { value: ResolveKey<S, K> | null; rev: number };
+    unsubscribe: UnsubscribeFn;
+  }> {
     const unsubscribe = this.subscribeKey(key, handler, opts);
-    const value = await this.room.store.get(key);
-    const initial: InitialKeySnapshot = { value, rev: this.room.getRev(key) };
-    return { initial, unsubscribe };
+    const value = (await this.room.store.get(key)) as ResolveKey<S, K> | null;
+    return { initial: { value, rev: this.room.getRev(key) }, unsubscribe };
   }
 
-  async subscribeWithSnapshotPrefix(
-    prefix: string,
-    handler: ChangeHandler,
+  async subscribeWithSnapshotPrefix<K extends string>(
+    prefix: K,
+    handler: (e: TypedChangeEvent<ResolveKey<S, K>>) => void,
     opts?: SubscribeOptions
   ): Promise<SubscribeWithSnapshotPrefixResult> {
     const unsubscribe = this.subscribePrefix(prefix, handler, opts);
@@ -821,12 +902,12 @@ export class MockRoomClient implements IRoomClient {
   // ── Internal ────────────────────────────────────────────────────────────────
 
   private assertOpen() {
-    if (this.closed) throw new RoomError("Disconnected");
+    if (this.closed) throw new RoomError("Disconnected", { kind: "transient" });
   }
 
   private assertWritable(key: string) {
     if (key.startsWith(META) || key.startsWith("presence/")) {
-      throw new RoomError("Reserved key prefix");
+      throw new RoomError("Reserved key prefix", { kind: "invalid" });
     }
   }
 
@@ -837,6 +918,7 @@ export class MockRoomClient implements IRoomClient {
     const result = await schema["~standard"].validate(value);
     if ("issues" in result) {
       throw new RoomError(`Validation failed for "${key}"`, {
+        kind: "validation",
         validationError: {
           key,
           schemaPattern: "<client-side>",

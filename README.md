@@ -2,7 +2,7 @@
 
 A generic PartyKit backend. Any app can connect and get real-time key-value storage, subscriptions, atomic ops, presence, broadcast, scheduled jobs, and schema-validated writes — with no server code to write.
 
-> **v3.0.0 — breaking release.** First-message auth replaces the query-string `apiKey`. `get()` now returns `{ value, rev }`. New methods: `update`, `transact`, `count`, `reserve`, `subscribeWithSnapshotKey/Prefix`, `registerSchemas`. Persistence levels renamed `memory`→`ephemeral`, `storage`→`durable`. See [Migration notes](#migration-notes) for the full diff.
+> **v3.1 — additive release with one constructor break.** `RoomClient<TSchema>` now infers value types from a schema map. The `schemas` constructor option groups server JSON Schema, client Standard Schema, and a numeric `version` for handshake-time registration. `reserve` accepts `SetOptions` (TTL). `RoomError.kind` exposes a discriminated union for ergonomic error handling. See [Migration notes](#migration-notes).
 
 ## Deploy the server
 
@@ -163,15 +163,18 @@ const { value } = await room.update<number>("counter", (current) => (current ?? 
 
 `update` is implemented client-side using `get` + `setIf({ ifRev })`. The function may run multiple times under contention, so keep it pure.
 
-### `room.reserve(key, value)` → `Promise<boolean>`
+### `room.reserve(key, value, opts?)` → `Promise<boolean>`
 
-Returns `true` if this caller won the race to create the key (i.e. the key did not exist), `false` otherwise. Common use: room metadata, room locks, primary-leader elections.
+Returns `true` if this caller won the race to create the key (i.e. the key did not exist), `false` otherwise. Common use: room metadata, room locks, primary-leader elections, abandoned-room cleanup with TTL.
 
 ```ts
 const won = await room.reserve("meta", { createdAt: Date.now(), createdBy: userId });
+
+// With TTL — useful for rooms that should self-clean if abandoned.
+await room.reserve("meta", DEFAULT_META(), { ttl: 60 * 60 * 24 * 30 }); // 30 days
 ```
 
-Equivalent to `setIf(key, value, { ifRev: 0 }).then(r => r.success)`.
+Equivalent to `setIf(key, value, { ifRev: 0, ttl })` returning the `success` flag. The TTL applies on successful reservation; on a failed race the existing key's TTL is untouched.
 
 ### `room.touch(key, { ttl })` → `Promise<void>`
 
@@ -280,6 +283,27 @@ All subscribe methods accept:
 
 `batchMs` is **flow control**, not true backpressure: the server collects changes for the subscription and flushes a single `change_batch` every N milliseconds, smoothing bursty fanout for slow consumers. Trades latency for fewer wire frames.
 
+**When to reach for `batchMs`:** default to immediate delivery. Consider `batchMs: 16` (one frame per animation tick) for prefixes that fire more than ~10 changes per second to a UI consumer that re-renders per event — e.g. a tally bar updating per vote in a 1k-voter poll. Bump higher (`100`–`250`) for analytics or background readers where sub-100ms latency doesn't matter. A subscription's effective `batchMs` is the **min** across all handlers attached to that key/prefix, so a single immediate-mode handler defeats batching for everyone on that subscription.
+
+#### Self-write detection with `includeSelf`
+
+When you opt into `includeSelf: true` for some subscriptions but not others, you may want to skip self-events on a per-handler basis — say, suppress your own typing indicator while still seeing it for others:
+
+```ts
+room.subscribePrefix("typing/", (event) => {
+  if (event.originConnId === room.connectionId) return; // skip my own writes
+  showTypingFor(event.key);
+}, { includeSelf: true });
+```
+
+`originConnId` is `null` for HTTP, alarm-driven, and TTL-sweep changes; that's how you distinguish a server-side mutation from any client write.
+
+### `subscribeWithSnapshotPrefix` capacity
+
+The atomic `(snapshot + subscribe)` primitive is bounded at **1000 entries** in the initial snapshot — beyond that, the server returns `truncated: true`. There is no streaming pagination cursor for the truncated tail in v3.1; the design choice is that prefixes large enough to truncate should be sharded at write time (e.g. `votes/<bucket>/<id>`) rather than papered over with handler-side pagination.
+
+If you absolutely need to read past the cap on cold start, fall back to `room.list(prefix)` after the subscription is registered — but be aware this reintroduces the bootstrap race the snapshot primitive was designed to close. For most apps the right answer is to design the key space so 1000 entries is generous (e.g. one prefix per poll, not one per app).
+
 ### `ChangeEvent`
 
 ```ts
@@ -292,18 +316,34 @@ type ChangeEvent =
 
 ### Presence
 
-The server automatically manages `presence/{connectionId}` entries on connect and disconnect. The presence value is `{ connectedAt, userId? }` if you passed `userId` in the connect config — letting subscribers derive user-level presence cheaply.
+The server automatically manages a `presence/{connectionId}` entry per live socket. On connect, `presence/{connId}` is set to `{ connectedAt, userId? }` (the `userId` is whatever you passed in the connect config — `null`/missing if you didn't). On graceful disconnect, the entry is deleted; on hibernation, surviving entries are pruned at room re-init.
+
+The `presence/` prefix is a normal subscribable namespace — the same primitives apply with no special-casing:
 
 ```ts
+// Read current online list — same call you'd use for any other prefix.
+const snap = await room.snapshot({ prefixes: ["presence/"] });
+const online = snap.prefixes["presence/"]; // Record<connectionId, { connectedAt, userId? }>
+
+// Subscribe to live online/offline transitions.
 const { initial, unsubscribe } = await room.subscribeWithSnapshotPrefix(
   "presence/",
   (event) => {
-    if (event.type === "delete") online.delete(event.key);
-    else                         online.set(event.key, event.value);
+    if (event.type === "delete") onlineByUser.delete(event.key);
+    else                         onlineByUser.set(event.key, event.value);
   }
 );
-const online = new Map(Object.entries(initial.entries));
 ```
+
+`change` events fire on connect (as `set`) and disconnect (as `delete`) just like any other key. TTL applies the same way (none by default — entries are cleared when the socket closes, not by clock). The reserved prefix means clients **cannot** write under `presence/` themselves; this is the only namespace constraint on the otherwise generic key space.
+
+A common pattern (and what you should reach for first) is to consolidate "is the socket alive?" with "what is this user doing?" by:
+
+- letting the server own `presence/` (alive/dead, derived from the socket),
+- writing your own `users/{userId}` records for app-level state (mode, profile, …),
+- joining the two on the read side via `userId` in the presence value.
+
+This composes without a 10-second heartbeat loop on the client.
 
 ### `room.broadcast(channel, data)`
 
@@ -321,7 +361,7 @@ const unsub = room.onBroadcast("chat", (data) => console.log(data));
 
 ### `room.disconnect()`
 
-Close the WebSocket connection immediately. Pending operations are rejected.
+Close the WebSocket connection immediately. Pending operations are rejected with `RoomError` (`kind: "transient"`).
 
 ### `room.flushAndDisconnect(timeoutMs?)` → `Promise<void>`
 
@@ -332,6 +372,17 @@ window.addEventListener("beforeunload", () => {
   room.flushAndDisconnect();
 });
 ```
+
+Behavior under each connection state:
+
+| `room.status` when called | What `flushAndDisconnect` does |
+|---|---|
+| `"ready"` | Awaits ack of every in-flight op (or `timeoutMs`, default 5000). Returns once the socket is closed. |
+| `"reconnecting"` | Does **not** await reconnect. The pending ops are kept until either the socket reconnects and acks them within `timeoutMs`, or the timeout elapses. Either way, the socket is then closed and the promise resolves. |
+| `"connecting"` | Same as `"reconnecting"`. |
+| `"closed"` | No-op; resolves immediately. |
+
+The promise itself never rejects — pending op promises do (`kind: "transient"`) if they didn't get acks before close. Treat `flushAndDisconnect` as a best-effort drain, not a guarantee of delivery.
 
 ---
 
@@ -348,51 +399,83 @@ Every user-visible key has a monotonically increasing revision number stored at 
 
 ## Schema validation
 
-Two complementary layers — server-side enforcement and optional client-side pre-validation.
-
-### Server-side: register JSON Schema in the room
+Three layers, declared in one place — the `schemas` constructor option:
 
 ```ts
-await room.registerSchemas({
-  // Prefix pattern (trailing /)
-  "users/": {
-    type: "object",
-    required: ["name"],
-    properties: { name: { type: "string", minLength: 1 } },
-    additionalProperties: false,
-  },
-  // Exact key
-  "meta": {
-    type: "object",
-    properties: { version: { type: "integer", minimum: 1 } },
-  },
-  // Catch-all
-  "*": { type: "object" },
-});
-```
-
-Schemas persist in the room. Subsequent writes whose key matches a pattern are validated; failures return an `error` with a `validationError: { key, schemaPattern, errors[] }` payload.
-
-Pattern resolution: exact key > longest matching prefix > `"*"`. The bundled validator covers a pragmatic subset of JSON Schema Draft 7 (`type`, `enum`, `const`, `required`, `properties`, `additionalProperties`, `items`, `minLength/maxLength/pattern`, `minimum/maximum`, `oneOf/anyOf/allOf`). It is intentionally minimal so the whole module fits in a Cloudflare Worker without a 100KB+ bundled validator. For richer schemas, layer client-side validation on top.
-
-### Client-side: optional Standard Schema validators
-
-Pass a `schemas` map to the constructor. Any value type whose validator implements the [Standard Schema](https://github.com/standard-schema/standard-schema) interface (Zod, Valibot, ArkType, etc.) works as-is.
-
-```ts
+import { RoomClient } from "room-server/client";
 import { z } from "zod";
 
-const room = new RoomClient({
+interface RoomSchema {
+  meta:     { title: string; version: number };
+  settings: { tally: "borda" | "copeland" };
+  "users/": { name: string; mode: "voting" | "idle" };
+  "votes/": { voterId: string; option: string };
+}
+
+const room = new RoomClient<RoomSchema>({
   host, roomId,
-  config: { apiKey: "key-app1" },
+  config: { apiKey: "key-app1", userId: "alice" },
   schemas: {
-    "users/": z.object({ name: z.string().min(1) }),
-    "meta":   z.object({ version: z.number().int().positive() }),
+    // 1. JSON Schema for server-side enforcement.
+    server: {
+      meta:     { type: "object", required: ["title", "version"], properties: { title: { type: "string" }, version: { type: "integer", minimum: 1 } } },
+      "users/": { type: "object", required: ["name"], properties: { name: { type: "string", minLength: 1 } } },
+    },
+    // 2. Optional Standard Schema for fast client-side pre-validation.
+    client: {
+      meta:     z.object({ title: z.string().min(1), version: z.number().int().positive() }),
+      "users/": z.object({ name: z.string().min(1), mode: z.enum(["voting", "idle"]) }),
+    },
+    // 3. Monotonic version. Server stores it; only `version > current` re-uploads.
+    version: 3,
   },
 });
 ```
 
-Client-side schemas are checked before each `set`, `setIf`, `update`, and `transact`. Failures throw `RoomError` with the same `validationError` shape as server-side rejections, but never reach the wire.
+### What each layer does
+
+- **`server`** — JSON Schema map. Persisted in the room. Every write (WS or HTTP) is validated against the matching pattern; failures return an `error` with `kind: "validation"` and a `validationError` payload. Resolution: exact key > longest prefix > `"*"`. The bundled validator implements the pragmatic subset of Draft 7 (`type`, `enum`, `const`, `required`, `properties`, `additionalProperties`, `items`, `minLength/maxLength/pattern`, `minimum/maximum`, `oneOf/anyOf/allOf`).
+- **`client`** — optional Standard Schema validators ([Zod](https://zod.dev/), Valibot, ArkType, etc.). Run locally before each `set`/`setIf`/`update`/`transact`; failures throw `RoomError` with `kind: "validation"` without crossing the wire.
+- **`version`** — monotonic integer. The handshake includes this number; if it's greater than the room's current version, the SDK auto-uploads `server` schemas with `replace: true` and bumps the room. If it's `≤ current`, the SDK skips registration entirely (zero bandwidth in steady state, deterministic under concurrent rolling deploys).
+
+### `RoomClient<TSchema>` type inference
+
+`TSchema` is a key-pattern → value-type map; the SDK narrows method signatures from it:
+
+```ts
+client.set("meta", { title: "Poll", version: 1 });    // ✓ value: Meta
+client.set("meta", { title: 42 });                    // ✗ TS error
+client.set("metaa", { … });                           // typo: value unconstrained (unknown)
+
+const m = await client.get("meta");                   // m.value: Meta | null
+
+client.update("meta", (current) => ({                 // current: Meta | null
+  ...current,
+  version: (current?.version ?? 0) + 1,
+}));
+
+client.subscribePrefix("votes/", (e) => {             // e.value: Vote on type "set"
+  if (e.type === "set") apply(e.value.option);
+});
+
+await client.reserve("meta", DEFAULT_META, { ttl });
+```
+
+Patterns: exact keys (`"meta"`), prefixes (`"votes/"`, must end with `/`), or catch-all (`"*"`). Resolution: exact > longest prefix > `"*"` > `unknown`. Prefer a TypeScript `interface RoomSchema { … }` declaration — works as well as `type RoomSchema = { … }` (the constraint is `object`, not `Record<string, unknown>`).
+
+### Manual schema registration
+
+`room.registerSchemas` is still available for ad-hoc updates from a privileged client:
+
+```ts
+await room.registerSchemas({ "votes/": NEW_VOTE_SCHEMA }, { replace: false, version: 4 });
+```
+
+Schemas are **forward-only**: registration validates only future writes. Pre-existing data is not re-validated, not quarantined, and continues to surface in `list`, `snapshot`, and `subscribe` results. Migrate explicitly (read-validate-rewrite under `setIf`) if you need to clean historical data.
+
+### Schema conflicts
+
+If two clients (e.g. an old tab and a new tab during a rolling deploy) try to register schemas concurrently with overlapping versions, the second fails with `RoomError` carrying `kind: "schemaConflict"` and a `schemaConflict: { incomingVersion, currentVersion }` payload. The SDK silently tolerates this in its auto-register path — the racing tab won, and the new room state is what you intended anyway.
 
 ---
 
@@ -420,7 +503,32 @@ room.on("rateLimit", ({ remaining, resetAt }) => {
 });
 ```
 
-When a request is denied, the rejected promise is a `RoomError` with an optional `rateLimit` field carrying `{ limit, window, remaining, resetAt }`.
+When a request is denied, the rejected promise is a `RoomError` with `kind: "rateLimit"` and a `rateLimit: { limit, window, remaining, resetAt }` field.
+
+### `RoomError`
+
+Every rejection from a `RoomClient` method is a `RoomError`. Discriminate on `.kind`:
+
+```ts
+import { RoomError } from "room-server/client";
+
+try {
+  await room.set("meta", value);
+} catch (e) {
+  if (!(e instanceof RoomError)) throw e;
+  switch (e.kind) {
+    case "validation":     // e.validationError: { key, schemaPattern, errors[] }
+    case "rateLimit":      // e.rateLimit: { limit, window, remaining, resetAt }
+    case "auth":           // bad apiKey, auth timeout, etc.
+    case "schemaConflict": // e.schemaConflict: { incomingVersion, currentVersion }
+    case "transient":      // socket closed, op disconnected before ack — safe to retry
+    case "invalid":        // client-side bad usage (reserved key, bad opts, …) — fix the call site
+    case "unknown":        // unmapped server error
+  }
+}
+```
+
+`transient` is the only kind that's generally safe to auto-retry; `invalid` and `validation` indicate consumer bugs and `auth`/`schemaConflict` need higher-level handling.
 
 ### Debug logging
 
@@ -578,7 +686,8 @@ wss://your-server.partykit.dev/parties/room/{apiKey}:{roomId}
 
 ```jsonc
 // Required first message — server rejects everything else until this lands.
-{ "op": "auth",                 "apiKey": "…", "userId": "…", "persistence": "durable", "requestId": "abc" }
+// `schemaVersion` (optional) lets the server decide whether to fast-path schema upload.
+{ "op": "auth",                 "apiKey": "…", "userId": "…", "persistence": "durable", "schemaVersion": 3, "requestId": "abc" }
 
 { "op": "set",                  "key": "k", "value": <any>, "ttl": 60,                   "requestId": "abc" }
 { "op": "get",                  "key": "k",                                              "requestId": "abc" }
@@ -586,13 +695,14 @@ wss://your-server.partykit.dev/parties/room/{apiKey}:{roomId}
 { "op": "list",                 "prefix": "users/", "limit": 10, "cursor": "…",          "requestId": "abc" }
 { "op": "count",                "prefix": "users/",                                      "requestId": "abc" }
 { "op": "increment",            "key": "k", "delta": 1,                                  "requestId": "abc" }
-{ "op": "set_if",               "key": "k", "value": <any>, "ifValue": <any>,            "requestId": "abc" }
-{ "op": "set_if",               "key": "k", "value": <any>, "ifRev": 7,                  "requestId": "abc" }
+{ "op": "set_if",               "key": "k", "value": <any>, "ifValue": <any>, "ttl": 60,  "requestId": "abc" }
+{ "op": "set_if",               "key": "k", "value": <any>, "ifRev": 7, "ttl": 60,        "requestId": "abc" }
 { "op": "touch",                "key": "k", "ttl": 60,                                   "requestId": "abc" }
 { "op": "delete_prefix",        "prefix": "votes/",                                      "requestId": "abc" }
 { "op": "snapshot",             "keys": ["…"], "prefixes": ["…/"],                       "requestId": "abc" }
 { "op": "transact",             "ops": [<TransactOp>, …],                                "requestId": "abc" }
-{ "op": "register_schemas",     "schemas": { "users/": <JsonSchema>, … }, "replace": false, "requestId": "abc" }
+// `version` is optional; when present the server rejects with kind:"schemaConflict" if `version <= current`.
+{ "op": "register_schemas",     "schemas": { "users/": <JsonSchema>, … }, "replace": false, "version": 3, "requestId": "abc" }
 
 { "op": "subscribe_key",        "key": "meta",      "includeSelf": false, "batchMs": 100 }
 { "op": "subscribe_prefix",     "prefix": "users/", "includeSelf": false, "batchMs": 100 }
@@ -614,8 +724,8 @@ Where `TransactOp` is one of:
 { "op": "set",       "key": "k", "value": <any>, "ttl": 60 }
 { "op": "delete",    "key": "k" }
 { "op": "increment", "key": "k", "delta": 1 }
-{ "op": "set_if",    "key": "k", "value": <any>, "ifValue": <any> }
-{ "op": "set_if",    "key": "k", "value": <any>, "ifRev": 7 }
+{ "op": "set_if",    "key": "k", "value": <any>, "ifValue": <any>, "ttl": 60 }
+{ "op": "set_if",    "key": "k", "value": <any>, "ifRev": 7,        "ttl": 60 }
 ```
 
 And `AlarmAction` is one of:
@@ -630,7 +740,7 @@ And `AlarmAction` is one of:
 **Server → Client**
 
 ```jsonc
-{ "op": "ready",                "persistence": "durable", "appId": "key-app1", "roomId": "my-room", "connectionId": "…" }
+{ "op": "ready",                "persistence": "durable", "appId": "key-app1", "roomId": "my-room", "connectionId": "…", "schemaVersion": 3 }
 { "op": "ack",                  "requestId": "abc" }
 { "op": "result",               "requestId": "abc", "key": "k", "value": <any>, "rev": 7 }
 { "op": "list_result",          "requestId": "abc", "prefix": "users/", "entries": {…}, "nextCursor": "…", "truncated": false }
@@ -640,7 +750,7 @@ And `AlarmAction` is one of:
 { "op": "snapshot_result",      "requestId": "abc", "keys": {…}, "prefixes": { "users/": {…} } }
 { "op": "transact_result",      "requestId": "abc", "success": true, "results": [<TransactOpResult>, …] }
 { "op": "snapshot_initial",     "requestId": "abc", "kind": "key" | "prefix", "target": "…", "value": <any>, "rev": 7, "entries": {…} }
-{ "op": "schemas_registered",   "requestId": "abc", "count": 3 }
+{ "op": "schemas_registered",   "requestId": "abc", "count": 3, "schemaVersion": 3 }
 
 { "op": "change",               "type": "set",    "key": "k", "value": <any>, "rev": 8, "originConnId": "conn-id" | null }
 { "op": "change",               "type": "delete", "key": "k",                  "rev": 9, "originConnId": "conn-id" | null }
@@ -649,17 +759,44 @@ And `AlarmAction` is one of:
 { "op": "broadcast_recv",       "channel": "chat", "data": <any> }
 { "op": "rate_limit_warning",   "remaining": 17, "resetAt": 1714500000000 }
 { "op": "error",                "requestId": "abc", "message": "…",
-                                "rateLimit": { "limit": 100, "window": 10000, "remaining": 0, "resetAt": 1714500000000 },
-                                "validationError": { "key": "users/alice", "schemaPattern": "users/", "errors": [{ "path": ".name", "message": "…" }] } }
+                                "kind": "validation" | "rateLimit" | "auth" | "schemaConflict" | "invalid" | "unknown",
+                                "rateLimit":       { "limit": 100, "window": 10000, "remaining": 0, "resetAt": 1714500000000 },
+                                "validationError": { "key": "users/alice", "schemaPattern": "users/", "errors": [{ "path": ".name", "message": "…" }] },
+                                "schemaConflict":  { "incomingVersion": 2, "currentVersion": 3 } }
 ```
 
-`originConnId` is `null` for HTTP, alarm-driven, and TTL-sweep changes. The `rateLimit` and `validationError` fields on `error` are only set when relevant.
+`originConnId` is `null` for HTTP, alarm-driven, and TTL-sweep changes. The `rateLimit`, `validationError`, and `schemaConflict` fields on `error` are only set when relevant; `kind` is always present in v3.1+ servers and discriminates which payload (if any) is attached.
 
 ---
 
 ## Migration notes
 
-Upgrading from v2.x:
+### Upgrading from v3.0 to v3.1
+
+One breaking change in the constructor; everything else is additive.
+
+- **`schemas` constructor option is now grouped.** v3.0 took a flat `schemas: ClientSchemaMap` (Standard Schema validators); v3.1 takes:
+
+  ```ts
+  new RoomClient<TSchema>({
+    …,
+    schemas: {
+      server?: { /* JSON Schema map */ },
+      client?: { /* Standard Schema map (was the old top-level value) */ },
+      version?: number,
+    },
+  });
+  ```
+
+  Drop-in fix: `schemas: foo` → `schemas: { client: foo }`. The new structure also unlocks server-side enforcement and version-gated handshake registration without a separate `await room.registerSchemas(...)` dance after `ready`.
+- **`RoomClient` is now generic.** `new RoomClient<RoomSchema>({ … })` infers value types on every method that takes/returns a key's value (`set`, `get`, `setIf`, `update`, `reserve`, `subscribeKey`, `subscribePrefix`, `subscribeWithSnapshotKey`, `subscribeWithSnapshotPrefix`). Without a generic argument, methods type as `unknown` (same as v3.0). No runtime impact.
+- **`reserve` accepts `SetOptions`.** `room.reserve(key, value, { ttl })` now schedules the TTL on a successful reservation. v3.0 had no way to set a TTL on `reserve`.
+- **`setIf` accepts a `ttl`** alongside `ifValue`/`ifRev`, applied on success. Mirrors the wire protocol's new field; no impact unless you opt in.
+- **`RoomError` has a `kind` discriminator.** Existing `validationError` and `rateLimit` fields are still set; v3.1 also adds `kind: "validation" | "rateLimit" | "auth" | "schemaConflict" | "transient" | "invalid" | "unknown"`. Switching on `.kind` is the recommended pattern. Pre-v3.1 errors that didn't include `kind` are inferred from the message and present optional fields.
+- **`schemaConflict` is a new error category.** Returned from `register_schemas` when `version <= currentSchemaVersion`. The SDK's auto-register-on-handshake path catches it silently; manual `room.registerSchemas` callers should now handle `kind: "schemaConflict"`.
+- **`AuthMsg`, `ReadyMsg`, `RegisterSchemasMsg`, `SchemasRegisteredMsg`, `ErrorMsg`, `SetIfMsg`, and `TransactOp.set_if` got new optional fields** (`schemaVersion`, `version`, `kind`, `ttl`, etc.). Older clients/servers continue to interoperate at the cost of the corresponding feature.
+
+### Upgrading from v2.x
 
 - **Auth moved out of the URL.** v2 sent `apiKey` and `persistence` as query-string params; v3 sends them as the first WebSocket frame (`{ op: "auth", apiKey, userId?, persistence? }`). The SDK does this automatically — no consumer change required, but custom protocol clients must update.
 - **Persistence levels renamed.** `"memory"` → `"ephemeral"`, `"storage"` → `"durable"`. There is no compat alias; existing rooms persisted with the old names will fail to hydrate. Since v2.x was a brief release, this is expected to affect at most one consumer.
@@ -668,6 +805,6 @@ Upgrading from v2.x:
 - **`setIf` signature changed.** The third argument is now an options object: `setIf(key, value, { ifValue })` or `setIf(key, value, { ifRev })`. The old positional `setIf(key, value, ifValue)` no longer compiles.
 - **`set` and `delete` return `{ rev }`.** Callers ignoring the return value continue to work.
 - **`list()` filters out expired TTL keys** — closes a v2 correctness gap where expired keys could surface in list results between sweeps.
-- **New methods**: `room.update`, `room.transact`, `room.count`, `room.reserve`, `room.subscribeWithSnapshotKey/Prefix`, `room.registerSchemas`. New constructor option `config.userId` and `options.schemas` (client-side Standard Schema validators).
+- **New methods**: `room.update`, `room.transact`, `room.count`, `room.reserve`, `room.subscribeWithSnapshotKey/Prefix`, `room.registerSchemas`. New constructor option `config.userId` and `options.schemas`.
 - **`subscribePrefix` and `subscribeKey` accept `batchMs`** for server-side flow control on noisy prefixes.
 - **TTL sweep is now O(log n)** via a sorted-by-expiry index — relevant only for rooms with many TTLs in flight.

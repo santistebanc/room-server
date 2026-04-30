@@ -8,6 +8,7 @@ import type {
   ListResult,
   PersistenceLevel,
   RateLimitInfo,
+  RoomErrorKind,
   ServerMsg,
   SnapshotResult,
   TransactOp,
@@ -22,6 +23,7 @@ export type {
   ListResult,
   PersistenceLevel,
   RateLimitInfo,
+  RoomErrorKind,
   SnapshotResult,
   TransactOp,
   TransactOpResult,
@@ -30,11 +32,42 @@ export type {
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
-export type ChangeEvent =
+/**
+ * A room schema is a map from key-pattern to value type. Patterns:
+ *
+ *  - exact key:  `"meta"`, `"settings"`
+ *  - prefix:     `"users/"`, `"votes/"` (must end with `/`)
+ *  - catch-all:  `"*"`
+ *
+ * Resolution priority (matches the server-side validator): exact > longest
+ * prefix > `"*"` > `unknown`. Both `interface Schema { ... }` and
+ * `type Schema = { ... }` declarations are accepted (the constraint is `object`
+ * rather than `Record<string, unknown>` so plain interfaces type-check).
+ */
+export type RoomSchemaMap = object;
+
+type MatchPrefix<S, K extends string> = {
+  [P in keyof S & string]: P extends `${infer Pre}/`
+    ? K extends `${Pre}/${string}`
+      ? S[P]
+      : never
+    : never;
+}[keyof S & string];
+
+/** Resolve the value type stored at `K` against schema map `S`. */
+export type ResolveKey<S, K extends string> = K extends keyof S
+  ? S[K]
+  : MatchPrefix<S, K> extends never
+    ? "*" extends keyof S
+      ? S["*"]
+      : unknown
+    : MatchPrefix<S, K>;
+
+export type TypedChangeEvent<V> =
   | {
       type: "set";
       key: string;
-      value: unknown;
+      value: V;
       /** Revision after this change. */
       rev: number;
       /** Connection that originated the write. `null` for HTTP, alarm, or TTL sweeps. */
@@ -46,6 +79,8 @@ export type ChangeEvent =
       rev: number;
       originConnId: string | null;
     };
+
+export type ChangeEvent = TypedChangeEvent<unknown>;
 
 export type ChangeHandler = (event: ChangeEvent) => void;
 export type BroadcastHandler = (data: unknown) => void;
@@ -142,17 +177,31 @@ export interface ValidationErrorPayload {
   errors: ValidationErrorDetail[];
 }
 
+export interface SchemaConflictPayload {
+  incomingVersion: number;
+  currentVersion: number;
+}
+
 export class RoomError extends Error {
+  kind: RoomErrorKind;
   rateLimit?: RateLimitInfo;
   validationError?: ValidationErrorPayload;
+  schemaConflict?: SchemaConflictPayload;
   constructor(
     message: string,
-    extras?: { rateLimit?: RateLimitInfo; validationError?: ValidationErrorPayload }
+    extras?: {
+      kind?: RoomErrorKind;
+      rateLimit?: RateLimitInfo;
+      validationError?: ValidationErrorPayload;
+      schemaConflict?: SchemaConflictPayload;
+    }
   ) {
     super(message);
     this.name = "RoomError";
+    this.kind = extras?.kind ?? "unknown";
     if (extras?.rateLimit) this.rateLimit = extras.rateLimit;
     if (extras?.validationError) this.validationError = extras.validationError;
+    if (extras?.schemaConflict) this.schemaConflict = extras.schemaConflict;
   }
 }
 
@@ -180,68 +229,97 @@ export interface StandardSchemaLike<T = unknown> {
 // entries without are exact keys. `"*"` is the catch-all.
 export type ClientSchemaMap = Record<string, StandardSchemaLike<unknown>>;
 
+/**
+ * Constructor schemas option. All three sub-fields are independent:
+ *
+ *  - `server` — JSON Schema map registered on the room (server-side validation
+ *    that rejects bad writes from any client). Persists across reconnects.
+ *  - `client` — Standard Schema validators run locally before each set/update,
+ *    failing fast without a round-trip.
+ *  - `version` — monotonic integer. When the local version > server's, the SDK
+ *    auto-uploads `server` schemas in the handshake. When local <= server, the
+ *    SDK skips registration entirely (zero bandwidth waste in steady state and
+ *    deterministic behavior under racing tabs running mixed code versions).
+ */
+export interface RoomSchemasConfig {
+  server?: Record<string, JsonSchema>;
+  client?: ClientSchemaMap;
+  version?: number;
+}
+
 export interface RoomClientOptions {
   host: string;
   roomId: string;
   config: ConnectConfig;
-  /**
-   * Optional client-side schemas validated locally before each `set`/`update`.
-   * Server-side schemas are registered separately via `registerSchemas()`.
-   */
-  schemas?: ClientSchemaMap;
+  schemas?: RoomSchemasConfig;
 }
 
-export interface IRoomClient {
+export interface IRoomClient<S extends RoomSchemaMap = RoomSchemaMap> {
   readonly status: Status;
   readonly connectionId: string | null;
+  readonly schemaVersion: number | null;
   debug: boolean;
 
   ready(timeoutMs?: number): Promise<void>;
 
-  set(key: string, value: unknown, opts?: SetOptions): Promise<SetResult>;
-  get(key: string): Promise<GetResult>;
+  set<K extends string>(key: K, value: ResolveKey<S, K>, opts?: SetOptions): Promise<SetResult>;
+  get<K extends string>(key: K): Promise<{ value: ResolveKey<S, K> | null; rev: number }>;
   delete(key: string): Promise<SetResult>;
   list(prefix: string, opts?: { limit?: number; cursor?: string }): Promise<ListResult>;
   count(prefix: string): Promise<CountResult>;
 
   increment(key: string, delta?: number): Promise<IncrementResult>;
-  setIf(key: string, value: unknown, opts: SetIfOptions): Promise<SetIfResult>;
-  update<T = unknown>(key: string, fn: (current: T | null) => T): Promise<{ value: T; rev: number }>;
+  setIf<K extends string>(
+    key: K,
+    value: ResolveKey<S, K>,
+    opts: SetIfOptions & SetOptions
+  ): Promise<SetIfResult>;
+  update<K extends string>(
+    key: K,
+    fn: (current: ResolveKey<S, K> | null) => ResolveKey<S, K>
+  ): Promise<{ value: ResolveKey<S, K>; rev: number }>;
   touch(key: string, opts: { ttl: number }): Promise<void>;
-  reserve(key: string, value: unknown): Promise<boolean>;
+  reserve<K extends string>(
+    key: K,
+    value: ResolveKey<S, K>,
+    opts?: SetOptions
+  ): Promise<boolean>;
   deletePrefix(prefix: string): Promise<DeletePrefixResult>;
   snapshot(req: SnapshotRequest): Promise<SnapshotResult>;
   transact(ops: TransactOp[]): Promise<TransactResult>;
 
   registerSchemas(
     schemas: Record<string, JsonSchema>,
-    opts?: { replace?: boolean }
-  ): Promise<{ count: number }>;
+    opts?: { replace?: boolean; version?: number }
+  ): Promise<{ count: number; schemaVersion: number }>;
 
   scheduleAlarm(delay: number, action?: AlarmAction): Promise<void>;
   cancelAlarm(): Promise<void>;
   scheduleRecurring(interval: number, action: AlarmAction): Promise<void>;
   cancelRecurring(): Promise<void>;
 
-  subscribeKey(
-    key: string,
-    handler: ChangeHandler,
+  subscribeKey<K extends string>(
+    key: K,
+    handler: (e: TypedChangeEvent<ResolveKey<S, K>>) => void,
     opts?: SubscribeOptions
   ): UnsubscribeFn;
-  subscribePrefix(
-    prefix: string,
-    handler: ChangeHandler,
+  subscribePrefix<K extends string>(
+    prefix: K,
+    handler: (e: TypedChangeEvent<ResolveKey<S, K>>) => void,
     opts?: SubscribeOptions
   ): UnsubscribeFn;
 
-  subscribeWithSnapshotKey(
-    key: string,
-    handler: ChangeHandler,
+  subscribeWithSnapshotKey<K extends string>(
+    key: K,
+    handler: (e: TypedChangeEvent<ResolveKey<S, K>>) => void,
     opts?: SubscribeOptions
-  ): Promise<SubscribeWithSnapshotKeyResult>;
-  subscribeWithSnapshotPrefix(
-    prefix: string,
-    handler: ChangeHandler,
+  ): Promise<{
+    initial: { value: ResolveKey<S, K> | null; rev: number };
+    unsubscribe: UnsubscribeFn;
+  }>;
+  subscribeWithSnapshotPrefix<K extends string>(
+    prefix: K,
+    handler: (e: TypedChangeEvent<ResolveKey<S, K>>) => void,
     opts?: SubscribeOptions
   ): Promise<SubscribeWithSnapshotPrefixResult>;
 
@@ -283,15 +361,16 @@ interface SubGroup {
 
 const UPDATE_MAX_RETRIES = 5;
 
-export class RoomClient<
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  TSchema extends Record<string, unknown> = Record<string, unknown>
-> implements IRoomClient {
+export class RoomClient<S extends RoomSchemaMap = RoomSchemaMap>
+  implements IRoomClient<S> {
   private socket: PartySocket;
   private pending = new Map<string, Pending>();
   private subs = new Map<string, SubGroup>();
   private broadcastHandlers = new Map<string, Set<BroadcastHandler>>();
   private clientSchemas?: ClientSchemaMap;
+  private serverSchemas?: Record<string, JsonSchema>;
+  private localSchemaVersion?: number;
+  private _serverSchemaVersion: number | null = null;
 
   private config: ConnectConfig;
 
@@ -317,7 +396,11 @@ export class RoomClient<
   constructor(opts: RoomClientOptions) {
     const { host, roomId, config, schemas } = opts;
     this.config = config;
-    this.clientSchemas = schemas;
+    if (schemas) {
+      this.clientSchemas = schemas.client;
+      this.serverSchemas = schemas.server;
+      this.localSchemaVersion = schemas.version;
+    }
 
     this.sessionId = makeSessionId();
 
@@ -371,6 +454,7 @@ export class RoomClient<
 
   get status(): Status { return this._status; }
   get connectionId(): string | null { return this._connectionId; }
+  get schemaVersion(): number | null { return this._serverSchemaVersion; }
 
   on<E extends keyof RoomClientEvents>(
     event: E,
@@ -418,26 +502,52 @@ export class RoomClient<
       apiKey: this.config.apiKey,
       ...(this.config.userId !== undefined ? { userId: this.config.userId } : {}),
       ...(this.config.persistence !== undefined ? { persistence: this.config.persistence } : {}),
+      ...(this.localSchemaVersion !== undefined ? { schemaVersion: this.localSchemaVersion } : {}),
     };
     this.sendRaw(authMsg);
   }
 
+  /**
+   * Called after `ready` arrives. If the consumer configured server schemas
+   * with a version, and our version is newer than the server's, auto-register.
+   * Schema conflicts (a racing tab beat us to it) are tolerated silently.
+   */
+  private async maybeRegisterServerSchemas() {
+    if (!this.serverSchemas) return;
+    if (this.localSchemaVersion === undefined) return;
+    if (this._serverSchemaVersion === null) return;
+    if (this.localSchemaVersion <= this._serverSchemaVersion) return;
+    try {
+      await this.registerSchemas(this.serverSchemas, {
+        version: this.localSchemaVersion,
+        replace: true,
+      });
+    } catch (err) {
+      if (err instanceof RoomError && err.kind === "schemaConflict") {
+        this.log("schemaConflict", err.schemaConflict);
+        return;
+      }
+      console.error("[room-server] auto-register schemas failed:", err);
+    }
+  }
+
   // ── CRUD ────────────────────────────────────────────────────────────────────
 
-  async set(key: string, value: unknown, opts?: SetOptions): Promise<SetResult> {
+  async set<K extends string>(
+    key: K,
+    value: ResolveKey<S, K>,
+    opts?: SetOptions
+  ): Promise<SetResult> {
     await this.maybeValidateLocal(key, value);
     const msg: ClientMsg = { op: "set", key, value, ...opts };
     await this.op(msg, () => undefined);
-    // The server returns ack (no rev). For consumers that need rev, use the
-    // change subscription or a follow-up get(). Returning a synthetic shape
-    // for forward compat — future versions may include rev in ack.
     return { rev: -1 };
   }
 
-  get(key: string): Promise<GetResult> {
+  get<K extends string>(key: K): Promise<{ value: ResolveKey<S, K> | null; rev: number }> {
     return this.opWithRaw({ op: "get", key }, (msg) => {
       if (msg.op !== "result") throw new Error("Unexpected response to get");
-      return { value: msg.value, rev: msg.rev };
+      return { value: msg.value as ResolveKey<S, K> | null, rev: msg.rev };
     });
   }
 
@@ -475,9 +585,13 @@ export class RoomClient<
     });
   }
 
-  async setIf(key: string, value: unknown, opts: SetIfOptions): Promise<SetIfResult> {
+  async setIf<K extends string>(
+    key: K,
+    value: ResolveKey<S, K>,
+    opts: SetIfOptions & SetOptions
+  ): Promise<SetIfResult> {
     if (opts.ifValue !== undefined && opts.ifRev !== undefined) {
-      throw new RoomError("Pass either ifValue or ifRev, not both");
+      throw new RoomError("Pass either ifValue or ifRev, not both", { kind: "invalid" });
     }
     await this.maybeValidateLocal(key, value);
     return this.opWithRaw(
@@ -487,6 +601,7 @@ export class RoomClient<
         value,
         ...(opts.ifValue !== undefined ? { ifValue: opts.ifValue } : {}),
         ...(opts.ifRev !== undefined ? { ifRev: opts.ifRev } : {}),
+        ...(opts.ttl !== undefined ? { ttl: opts.ttl } : {}),
       },
       (m) => {
         if (m.op !== "set_if_result") throw new Error("Unexpected response to set_if");
@@ -495,21 +610,31 @@ export class RoomClient<
     );
   }
 
-  async update<T = unknown>(
-    key: string,
-    fn: (current: T | null) => T
-  ): Promise<{ value: T; rev: number }> {
+  async update<K extends string>(
+    key: K,
+    fn: (current: ResolveKey<S, K> | null) => ResolveKey<S, K>
+  ): Promise<{ value: ResolveKey<S, K>; rev: number }> {
     for (let attempt = 0; attempt < UPDATE_MAX_RETRIES; attempt++) {
       const { value, rev } = await this.get(key);
-      const next = fn(value as T | null);
+      const next = fn(value);
       const result = await this.setIf(key, next, { ifRev: rev });
       if (result.success) return { value: next, rev: result.rev };
     }
-    throw new RoomError(`update("${key}") failed after ${UPDATE_MAX_RETRIES} retries`);
+    throw new RoomError(`update("${key}") failed after ${UPDATE_MAX_RETRIES} retries`, {
+      kind: "transient",
+    });
   }
 
-  async reserve(key: string, value: unknown): Promise<boolean> {
-    const result = await this.setIf(key, value, { ifRev: 0 });
+  async reserve<K extends string>(
+    key: K,
+    value: ResolveKey<S, K>,
+    opts?: SetOptions
+  ): Promise<boolean> {
+    const result = await this.setIf(
+      key,
+      value,
+      opts?.ttl !== undefined ? { ifRev: 0, ttl: opts.ttl } : { ifRev: 0 }
+    );
     return result.success;
   }
 
@@ -553,13 +678,15 @@ export class RoomClient<
 
   registerSchemas(
     schemas: Record<string, JsonSchema>,
-    opts?: { replace?: boolean }
-  ): Promise<{ count: number }> {
+    opts?: { replace?: boolean; version?: number }
+  ): Promise<{ count: number; schemaVersion: number }> {
     const msg: ClientMsg = { op: "register_schemas", schemas };
     if (opts?.replace) msg.replace = true;
+    if (opts?.version !== undefined) msg.version = opts.version;
     return this.opWithRaw(msg, (m) => {
       if (m.op !== "schemas_registered") throw new Error("Unexpected response to register_schemas");
-      return { count: m.count };
+      this._serverSchemaVersion = m.schemaVersion;
+      return { count: m.count, schemaVersion: m.schemaVersion };
     });
   }
 
@@ -583,25 +710,36 @@ export class RoomClient<
 
   // ── Subscriptions ───────────────────────────────────────────────────────────
 
-  subscribeKey(key: string, handler: ChangeHandler, opts?: SubscribeOptions): UnsubscribeFn {
-    return this.addSubscription("key", key, handler, opts);
+  subscribeKey<K extends string>(
+    key: K,
+    handler: (e: TypedChangeEvent<ResolveKey<S, K>>) => void,
+    opts?: SubscribeOptions
+  ): UnsubscribeFn {
+    return this.addSubscription("key", key, handler as ChangeHandler, opts);
   }
 
-  subscribePrefix(prefix: string, handler: ChangeHandler, opts?: SubscribeOptions): UnsubscribeFn {
+  subscribePrefix<K extends string>(
+    prefix: K,
+    handler: (e: TypedChangeEvent<ResolveKey<S, K>>) => void,
+    opts?: SubscribeOptions
+  ): UnsubscribeFn {
     if (prefix !== "" && !prefix.endsWith("/")) {
       throw new Error(
         `room-server: subscribePrefix("${prefix}") requires a trailing "/" or empty string. Use subscribeKey for exact matches.`
       );
     }
-    return this.addSubscription("prefix", prefix, handler, opts);
+    return this.addSubscription("prefix", prefix, handler as ChangeHandler, opts);
   }
 
-  async subscribeWithSnapshotKey(
-    key: string,
-    handler: ChangeHandler,
+  async subscribeWithSnapshotKey<K extends string>(
+    key: K,
+    handler: (e: TypedChangeEvent<ResolveKey<S, K>>) => void,
     opts?: SubscribeOptions
-  ): Promise<SubscribeWithSnapshotKeyResult> {
-    const unsubscribe = this.addSubscription("key", key, handler, opts);
+  ): Promise<{
+    initial: { value: ResolveKey<S, K> | null; rev: number };
+    unsubscribe: UnsubscribeFn;
+  }> {
+    const unsubscribe = this.addSubscription("key", key, handler as ChangeHandler, opts);
     try {
       const initial = await this.opWithRaw(
         {
@@ -614,7 +752,10 @@ export class RoomClient<
           if (m.op !== "snapshot_initial" || m.kind !== "key") {
             throw new Error("Unexpected response to subscribe_with_snapshot_key");
           }
-          return { value: m.value, rev: m.rev ?? 0 } satisfies InitialKeySnapshot;
+          return {
+            value: m.value as ResolveKey<S, K> | null,
+            rev: m.rev ?? 0,
+          };
         }
       );
       return { initial, unsubscribe };
@@ -624,9 +765,9 @@ export class RoomClient<
     }
   }
 
-  async subscribeWithSnapshotPrefix(
-    prefix: string,
-    handler: ChangeHandler,
+  async subscribeWithSnapshotPrefix<K extends string>(
+    prefix: K,
+    handler: (e: TypedChangeEvent<ResolveKey<S, K>>) => void,
     opts?: SubscribeOptions
   ): Promise<SubscribeWithSnapshotPrefixResult> {
     if (prefix !== "" && !prefix.endsWith("/")) {
@@ -634,7 +775,7 @@ export class RoomClient<
         `room-server: subscribeWithSnapshotPrefix("${prefix}") requires a trailing "/" or empty string.`
       );
     }
-    const unsubscribe = this.addSubscription("prefix", prefix, handler, opts);
+    const unsubscribe = this.addSubscription("prefix", prefix, handler as ChangeHandler, opts);
     try {
       const initial = await this.opWithRaw(
         {
@@ -790,7 +931,7 @@ export class RoomClient<
   disconnect() {
     this.userClosed = true;
     for (const { reject } of this.pending.values()) {
-      reject(new RoomError("Disconnected"));
+      reject(new RoomError("Disconnected", { kind: "transient" }));
     }
     this.pending.clear();
     this.socket.close();
@@ -858,6 +999,7 @@ export class RoomClient<
         message: i.message,
       }));
       throw new RoomError(`Validation failed for "${key}"`, {
+        kind: "validation",
         validationError: { key, schemaPattern: "<client-side>", errors },
       });
     }
@@ -867,8 +1009,10 @@ export class RoomClient<
     switch (msg.op) {
       case "ready":
         this._connectionId = msg.connectionId;
+        this._serverSchemaVersion = msg.schemaVersion;
         this.setStatus("ready");
         if (!this.readySettled) this.resolveReady();
+        void this.maybeRegisterServerSchemas();
         break;
 
       case "ack": {
@@ -918,9 +1062,12 @@ export class RoomClient<
 
       case "error": {
         this.log("error", msg);
+        const kind: RoomErrorKind = msg.kind ?? inferKind(msg);
         const err = new RoomError(msg.message, {
+          kind,
           ...(msg.rateLimit ? { rateLimit: msg.rateLimit } : {}),
           ...(msg.validationError ? { validationError: msg.validationError } : {}),
+          ...(msg.schemaConflict ? { schemaConflict: msg.schemaConflict } : {}),
         });
         if (msg.requestId) {
           this.pending.get(msg.requestId)?.reject(err);
@@ -1022,4 +1169,32 @@ function pathSegmentsToString(
     else                      out += `.${String(k)}`;
   }
   return out;
+}
+
+/**
+ * Fallback when the server omits `kind` (older server). Infers from the
+ * presence of optional fields and a small allowlist of known messages.
+ */
+function inferKind(msg: {
+  message: string;
+  rateLimit?: unknown;
+  validationError?: unknown;
+  schemaConflict?: unknown;
+}): RoomErrorKind {
+  if (msg.validationError) return "validation";
+  if (msg.rateLimit) return "rateLimit";
+  if (msg.schemaConflict) return "schemaConflict";
+  const m = msg.message.toLowerCase();
+  if (m.includes("auth")) return "auth";
+  if (m.includes("rate limit") || m.includes("connection limit")) return "rateLimit";
+  if (
+    m.includes("reserved key") ||
+    m.includes("must be") ||
+    m.includes("invalid") ||
+    m.includes("unknown op") ||
+    m.includes("either if")
+  ) {
+    return "invalid";
+  }
+  return "unknown";
 }

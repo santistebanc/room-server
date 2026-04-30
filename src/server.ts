@@ -7,9 +7,11 @@ import type {
   ChangeMsg,
   ClientMsg,
   Env,
+  ErrorMsg,
   JsonSchema,
   PersistenceLevel,
   RateLimitInfo,
+  RoomErrorKind,
   ServerMsg,
   TransactOp,
   TransactOpResult,
@@ -22,6 +24,7 @@ const META_REV = `${META}rev/`;
 const META_TTL = `${META}ttl/`;                     // key -> expiresAt
 const META_TTL_BY_EXPIRY = `${META}ttlByExpiry/`;   // padded(expiresAt)-key -> key
 const META_SCHEMAS = `${META}schemas`;
+const META_SCHEMA_VERSION = `${META}schemaVersion`;
 const META_PERSISTENCE = `${META}persistence`;
 const META_APP_ID = `${META}appId`;
 const META_ROOM_ID = `${META}roomId`;
@@ -80,6 +83,7 @@ export default class RoomServer implements Party.Server {
 
   // Schemas registered in this room. Keyed by pattern (prefix-with-/, exact key, or "*").
   private schemas: Record<string, JsonSchema> = {};
+  private schemaVersion = 0;
 
   private connections = new Map<string, ConnState>();
 
@@ -117,6 +121,8 @@ export default class RoomServer implements Party.Server {
 
       const savedSchemas = await dos.get<Record<string, JsonSchema>>(META_SCHEMAS);
       if (savedSchemas) this.schemas = savedSchemas;
+      const savedSchemaVersion = await dos.get<number>(META_SCHEMA_VERSION);
+      if (typeof savedSchemaVersion === "number") this.schemaVersion = savedSchemaVersion;
 
       const liveConnections = [...this.party.getConnections()];
       this.connectionCount = liveConnections.length;
@@ -141,7 +147,7 @@ export default class RoomServer implements Party.Server {
 
   async onConnect(conn: Party.Connection) {
     if (this.connectionCount >= this.maxConnections) {
-      send(conn, { op: "error", message: "Room connection limit reached" });
+      sendError(conn, "rateLimit", "Room connection limit reached");
       conn.close(4002, "Connection limit reached");
       return;
     }
@@ -153,7 +159,7 @@ export default class RoomServer implements Party.Server {
       authTimeout: setTimeout(() => {
         const c = this.party.getConnection(conn.id);
         if (c) {
-          send(c, { op: "error", message: "Auth timeout" });
+          sendError(c, "auth", "Auth timeout");
           c.close(4003, "Auth timeout");
         }
       }, this.authTimeoutMs),
@@ -169,7 +175,7 @@ export default class RoomServer implements Party.Server {
 
     const rate = this.checkRateLimit(conn.id);
     if (!rate.allowed) {
-      send(conn, { op: "error", message: "Rate limit exceeded", rateLimit: toRateLimitInfo(rate) });
+      sendError(conn, "rateLimit", "Rate limit exceeded", { rateLimit: toRateLimitInfo(rate) });
       return;
     }
     this.maybeWarnRateLimit(conn, conn.id, rate);
@@ -180,18 +186,19 @@ export default class RoomServer implements Party.Server {
         typeof message === "string" ? message : new TextDecoder().decode(message)
       ) as ClientMsg;
     } catch {
-      send(conn, { op: "error", message: "Invalid JSON" });
+      sendError(conn, "invalid", "Invalid JSON");
       return;
     }
 
     try {
       if (!state.authenticated) {
         if (msg.op !== "auth") {
-          send(conn, {
-            op: "error",
-            requestId: (msg as { requestId?: string }).requestId,
-            message: "Auth required — send {op:'auth',apiKey,userId?,persistence?} as the first message",
-          });
+          sendError(
+            conn,
+            "auth",
+            "Auth required — send {op:'auth',apiKey,userId?,persistence?,schemaVersion?} as the first message",
+            { requestId: (msg as { requestId?: string }).requestId }
+          );
           return;
         }
         await this.handleAuth(msg, conn, state);
@@ -200,10 +207,8 @@ export default class RoomServer implements Party.Server {
 
       await this.handle(msg, conn, state);
     } catch (err) {
-      send(conn, {
-        op: "error",
+      sendError(conn, "unknown", err instanceof Error ? err.message : "Internal error", {
         requestId: (msg as { requestId?: string }).requestId,
-        message: err instanceof Error ? err.message : "Internal error",
       });
     }
   }
@@ -408,7 +413,7 @@ export default class RoomServer implements Party.Server {
     const env = this.party.env as Env;
     const authResult = this.authenticate(msg.apiKey, env);
     if (!authResult.ok) {
-      send(conn, { op: "error", requestId: msg.requestId, message: authResult.reason });
+      sendError(conn, "auth", authResult.reason, { requestId: msg.requestId });
       conn.close(4001, "Unauthorized");
       return;
     }
@@ -444,6 +449,7 @@ export default class RoomServer implements Party.Server {
       appId: this.appId,
       roomId: this.roomId,
       connectionId: conn.id,
+      schemaVersion: this.schemaVersion,
     });
   }
 
@@ -452,17 +458,17 @@ export default class RoomServer implements Party.Server {
   private async handle(msg: ClientMsg, conn: Party.Connection, state: ConnState) {
     switch (msg.op) {
       case "auth":
-        send(conn, { op: "error", requestId: msg.requestId, message: "Already authenticated" });
+        sendError(conn, "invalid", "Already authenticated", { requestId: msg.requestId });
         break;
 
       case "set": {
         if (msg.key.startsWith(META) || msg.key.startsWith("presence/")) {
-          send(conn, { op: "error", requestId: msg.requestId, message: "Reserved key prefix" });
+          sendError(conn, "invalid", "Reserved key prefix", { requestId: msg.requestId });
           break;
         }
         const errs = this.validateWrite(msg.key, msg.value);
         if (errs) {
-          send(conn, { op: "error", requestId: msg.requestId, message: "Validation failed", validationError: errs });
+          sendError(conn, "validation", "Validation failed", { requestId: msg.requestId, validationError: errs });
           break;
         }
         await this.store.set(msg.key, msg.value);
@@ -489,7 +495,7 @@ export default class RoomServer implements Party.Server {
 
       case "delete": {
         if (msg.key.startsWith(META) || msg.key.startsWith("presence/")) {
-          send(conn, { op: "error", requestId: msg.requestId, message: "Reserved key prefix" });
+          sendError(conn, "invalid", "Reserved key prefix", { requestId: msg.requestId });
           break;
         }
         await this.store.delete(msg.key);
@@ -528,7 +534,7 @@ export default class RoomServer implements Party.Server {
 
       case "increment": {
         if (msg.key.startsWith(META) || msg.key.startsWith("presence/")) {
-          send(conn, { op: "error", requestId: msg.requestId, message: "Reserved key prefix" });
+          sendError(conn, "invalid", "Reserved key prefix", { requestId: msg.requestId });
           break;
         }
         const current = await this.getWithTTLCheck(msg.key, conn.id);
@@ -536,7 +542,7 @@ export default class RoomServer implements Party.Server {
         const next = num + (msg.delta ?? 1);
         const errs = this.validateWrite(msg.key, next);
         if (errs) {
-          send(conn, { op: "error", requestId: msg.requestId, message: "Validation failed", validationError: errs });
+          sendError(conn, "validation", "Validation failed", { requestId: msg.requestId, validationError: errs });
           break;
         }
         await this.store.set(msg.key, next);
@@ -549,11 +555,11 @@ export default class RoomServer implements Party.Server {
 
       case "set_if": {
         if (msg.key.startsWith(META) || msg.key.startsWith("presence/")) {
-          send(conn, { op: "error", requestId: msg.requestId, message: "Reserved key prefix" });
+          sendError(conn, "invalid", "Reserved key prefix", { requestId: msg.requestId });
           break;
         }
         if (msg.ifValue !== undefined && msg.ifRev !== undefined) {
-          send(conn, { op: "error", requestId: msg.requestId, message: "Pass either ifValue or ifRev, not both" });
+          sendError(conn, "invalid", "Pass either ifValue or ifRev, not both", { requestId: msg.requestId });
           break;
         }
         const current = await this.getWithTTLCheck(msg.key, conn.id);
@@ -565,10 +571,13 @@ export default class RoomServer implements Party.Server {
         if (match) {
           const errs = this.validateWrite(msg.key, msg.value);
           if (errs) {
-            send(conn, { op: "error", requestId: msg.requestId, message: "Validation failed", validationError: errs });
+            sendError(conn, "validation", "Validation failed", { requestId: msg.requestId, validationError: errs });
             break;
           }
           await this.store.set(msg.key, msg.value);
+          await this.clearTTL(msg.key, true);
+          if (msg.ttl) await this.scheduleTTL(msg.key, msg.ttl);
+          await this.rescheduleNextAlarm(this.party.storage as unknown as DurableObjectStorage);
           await this.bumpRev(msg.key);
           const newRev = await this.getRev(msg.key);
           send(conn, { op: "set_if_result", requestId: msg.requestId, success: true, current, rev: newRev });
@@ -581,16 +590,16 @@ export default class RoomServer implements Party.Server {
 
       case "touch": {
         if (msg.key.startsWith(META) || msg.key.startsWith("presence/")) {
-          send(conn, { op: "error", requestId: msg.requestId, message: "Reserved key prefix" });
+          sendError(conn, "invalid", "Reserved key prefix", { requestId: msg.requestId });
           break;
         }
         if (typeof msg.ttl !== "number" || msg.ttl <= 0) {
-          send(conn, { op: "error", requestId: msg.requestId, message: "ttl must be > 0" });
+          sendError(conn, "invalid", "ttl must be > 0", { requestId: msg.requestId });
           break;
         }
         const current = await this.store.get(msg.key);
         if (current === null || current === undefined) {
-          send(conn, { op: "error", requestId: msg.requestId, message: "Cannot touch key (does not exist or is null)" });
+          sendError(conn, "invalid", "Cannot touch key (does not exist or is null)", { requestId: msg.requestId });
           break;
         }
         await this.scheduleTTL(msg.key, msg.ttl);
@@ -600,13 +609,12 @@ export default class RoomServer implements Party.Server {
 
       case "delete_prefix": {
         if (msg.prefix === "" || msg.prefix.startsWith(META) || msg.prefix.startsWith("presence/")) {
-          send(conn, {
-            op: "error",
-            requestId: msg.requestId,
-            message: msg.prefix === ""
-              ? "delete_prefix requires a non-empty prefix"
-              : "Reserved key prefix",
-          });
+          sendError(
+            conn,
+            "invalid",
+            msg.prefix === "" ? "delete_prefix requires a non-empty prefix" : "Reserved key prefix",
+            { requestId: msg.requestId }
+          );
           break;
         }
         const deleted = await this.deletePrefix(msg.prefix, conn.id);
@@ -617,7 +625,7 @@ export default class RoomServer implements Party.Server {
       case "snapshot": {
         const result = await this.handleSnapshot(msg.keys, msg.prefixes, conn.id);
         if ("error" in result) {
-          send(conn, { op: "error", requestId: msg.requestId, message: result.error });
+          sendError(conn, "invalid", result.error, { requestId: msg.requestId });
           break;
         }
         send(conn, {
@@ -637,7 +645,7 @@ export default class RoomServer implements Party.Server {
 
       case "subscribe_key": {
         if (msg.key.startsWith(META)) {
-          send(conn, { op: "error", message: "Reserved key prefix" });
+          sendError(conn, "invalid", "Reserved key prefix");
           break;
         }
         state.subs.keys.set(msg.key, { includeSelf: msg.includeSelf === true, batchMs: msg.batchMs });
@@ -646,11 +654,11 @@ export default class RoomServer implements Party.Server {
 
       case "subscribe_prefix": {
         if (msg.prefix !== "" && !msg.prefix.endsWith("/")) {
-          send(conn, { op: "error", message: "Prefix must end with '/' or be empty string" });
+          sendError(conn, "invalid", "Prefix must end with '/' or be empty string");
           break;
         }
         if (msg.prefix.startsWith(META)) {
-          send(conn, { op: "error", message: "Reserved key prefix" });
+          sendError(conn, "invalid", "Reserved key prefix");
           break;
         }
         state.subs.prefixes.set(msg.prefix, { includeSelf: msg.includeSelf === true, batchMs: msg.batchMs });
@@ -659,7 +667,7 @@ export default class RoomServer implements Party.Server {
 
       case "subscribe_with_snapshot_key": {
         if (msg.key.startsWith(META)) {
-          send(conn, { op: "error", requestId: msg.requestId, message: "Reserved key prefix" });
+          sendError(conn, "invalid", "Reserved key prefix", { requestId: msg.requestId });
           break;
         }
         state.subs.keys.set(msg.key, { includeSelf: msg.includeSelf === true, batchMs: msg.batchMs });
@@ -678,11 +686,11 @@ export default class RoomServer implements Party.Server {
 
       case "subscribe_with_snapshot_prefix": {
         if (msg.prefix !== "" && !msg.prefix.endsWith("/")) {
-          send(conn, { op: "error", requestId: msg.requestId, message: "Prefix must end with '/' or be empty string" });
+          sendError(conn, "invalid", "Prefix must end with '/' or be empty string", { requestId: msg.requestId });
           break;
         }
         if (msg.prefix.startsWith(META)) {
-          send(conn, { op: "error", requestId: msg.requestId, message: "Reserved key prefix" });
+          sendError(conn, "invalid", "Reserved key prefix", { requestId: msg.requestId });
           break;
         }
         state.subs.prefixes.set(msg.prefix, { includeSelf: msg.includeSelf === true, batchMs: msg.batchMs });
@@ -715,21 +723,38 @@ export default class RoomServer implements Party.Server {
       }
 
       case "register_schemas": {
+        if (msg.version !== undefined && msg.version <= this.schemaVersion) {
+          sendError(
+            conn,
+            "schemaConflict",
+            `Schema version ${msg.version} <= current ${this.schemaVersion}`,
+            {
+              requestId: msg.requestId,
+              schemaConflict: { incomingVersion: msg.version, currentVersion: this.schemaVersion },
+            }
+          );
+          break;
+        }
         if (msg.replace) this.schemas = { ...msg.schemas };
         else             this.schemas = { ...this.schemas, ...msg.schemas };
         const dos = this.party.storage as unknown as DurableObjectStorage;
         await dos.put(META_SCHEMAS, this.schemas);
+        if (msg.version !== undefined) {
+          this.schemaVersion = msg.version;
+          await dos.put(META_SCHEMA_VERSION, msg.version);
+        }
         send(conn, {
           op: "schemas_registered",
           requestId: msg.requestId,
           count: Object.keys(this.schemas).length,
+          schemaVersion: this.schemaVersion,
         });
         break;
       }
 
       case "schedule_alarm": {
         if (msg.delay < 0) {
-          send(conn, { op: "error", requestId: msg.requestId, message: "delay must be >= 0" });
+          sendError(conn, "invalid", "delay must be >= 0", { requestId: msg.requestId });
           break;
         }
         const dos = this.party.storage as unknown as DurableObjectStorage;
@@ -751,7 +776,7 @@ export default class RoomServer implements Party.Server {
 
       case "schedule_recurring": {
         if (msg.interval <= 0) {
-          send(conn, { op: "error", requestId: msg.requestId, message: "interval must be > 0" });
+          sendError(conn, "invalid", "interval must be > 0", { requestId: msg.requestId });
           break;
         }
         const dos = this.party.storage as unknown as DurableObjectStorage;
@@ -776,7 +801,7 @@ export default class RoomServer implements Party.Server {
       default: {
         const _exhaustive: never = msg;
         void _exhaustive;
-        send(conn, { op: "error", message: "Unknown op" });
+        sendError(conn, "invalid", "Unknown op");
       }
     }
   }
@@ -852,10 +877,8 @@ export default class RoomServer implements Party.Server {
       if (p.deleted) continue;
       const errs = this.validateWrite(key, p.value);
       if (errs) {
-        send(conn, {
-          op: "error",
+        sendError(conn, "validation", `Validation failed for "${key}"`, {
           requestId: msg.requestId,
-          message: `Validation failed for "${key}"`,
           validationError: errs,
         });
         return;
@@ -903,6 +926,8 @@ export default class RoomServer implements Party.Server {
         case "set_if": {
           const current = await this.getWithTTLCheck(op.key, null);
           await this.store.set(op.key, op.value);
+          await this.clearTTL(op.key, true);
+          if (op.ttl) await this.scheduleTTL(op.key, op.ttl);
           await this.bumpRev(op.key);
           const rev = await this.getRev(op.key);
           results.push({ op: "set_if", key: op.key, success: true, current, rev });
@@ -1379,6 +1404,25 @@ export default class RoomServer implements Party.Server {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function send(conn: Party.Connection, msg: ServerMsg) {
+  conn.send(JSON.stringify(msg));
+}
+
+function sendError(
+  conn: Party.Connection,
+  kind: RoomErrorKind,
+  message: string,
+  extras?: {
+    requestId?: string;
+    rateLimit?: RateLimitInfo;
+    validationError?: ErrorMsg["validationError"];
+    schemaConflict?: ErrorMsg["schemaConflict"];
+  }
+) {
+  const msg: ErrorMsg = { op: "error", kind, message };
+  if (extras?.requestId !== undefined) msg.requestId = extras.requestId;
+  if (extras?.rateLimit) msg.rateLimit = extras.rateLimit;
+  if (extras?.validationError) msg.validationError = extras.validationError;
+  if (extras?.schemaConflict) msg.schemaConflict = extras.schemaConflict;
   conn.send(JSON.stringify(msg));
 }
 
