@@ -76,6 +76,14 @@ export type TypedChangeEvent<V> =
   | {
       type: "delete";
       key: string;
+      /**
+       * Last known value before the delete. The server emits this on every
+       * delete event when it can read the prior value cheaply (which is
+       * essentially always). `null` when the key was already absent or the
+       * prior value really was `null`. Lets subscribers maintain derived
+       * state keyed by something other than the storage key.
+       */
+      priorValue: V | null;
       rev: number;
       originConnId: string | null;
     };
@@ -1011,8 +1019,13 @@ export class RoomClient<S extends RoomSchemaMap = RoomSchemaMap>
         this._connectionId = msg.connectionId;
         this._serverSchemaVersion = msg.schemaVersion;
         this.setStatus("ready");
-        if (!this.readySettled) this.resolveReady();
-        void this.maybeRegisterServerSchemas();
+        // Resolve `ready()` only after auto-schema-registration has settled, so
+        // `client.schemaVersion` reflects the post-upload state when consumers
+        // probe it directly after `await room.ready()`. Errors don't block —
+        // the `ready` message itself already arrived.
+        void this.maybeRegisterServerSchemas().finally(() => {
+          if (!this.readySettled) this.resolveReady();
+        });
         break;
 
       case "ack": {
@@ -1094,7 +1107,13 @@ export class RoomClient<S extends RoomSchemaMap = RoomSchemaMap>
     const event: ChangeEvent =
       msg.type === "set"
         ? { type: "set", key: msg.key, value: msg.value, rev: msg.rev, originConnId: msg.originConnId }
-        : { type: "delete", key: msg.key, rev: msg.rev, originConnId: msg.originConnId };
+        : {
+            type: "delete",
+            key: msg.key,
+            priorValue: msg.priorValue ?? null,
+            rev: msg.rev,
+            originConnId: msg.originConnId,
+          };
 
     for (const group of this.subs.values()) {
       const matches =

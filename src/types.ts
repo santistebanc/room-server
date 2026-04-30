@@ -379,6 +379,14 @@ export type ChangeMsg =
       op: "change";
       type: "delete";
       key: string;
+      /**
+       * Last known value before the delete. Best-effort: the server includes it
+       * when it can read the prior value cheaply (which is almost always). May be
+       * `null` if the key was already absent or the prior value was `null`.
+       * Lets subscribers maintain derived state keyed by something other than
+       * the storage key (e.g. a `Set<userId>` derived from `presence/{connId}`).
+       */
+      priorValue?: unknown;
       rev: number;
       originConnId: string | null;
     };

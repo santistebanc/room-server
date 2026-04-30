@@ -2,7 +2,9 @@
 
 A generic PartyKit backend. Any app can connect and get real-time key-value storage, subscriptions, atomic ops, presence, broadcast, scheduled jobs, and schema-validated writes — with no server code to write.
 
-> **v3.1 — additive release with one constructor break.** `RoomClient<TSchema>` now infers value types from a schema map. The `schemas` constructor option groups server JSON Schema, client Standard Schema, and a numeric `version` for handshake-time registration. `reserve` accepts `SetOptions` (TTL). `RoomError.kind` exposes a discriminated union for ergonomic error handling. See [Migration notes](#migration-notes).
+> **v3.2 — fully additive.** `delete` change events now carry `priorValue` (the last-known value before the delete), enabling derived-state subscribers to evict by a non-storage-key without a side-map. `room.ready()` waits for auto-schema-registration to settle, so `room.schemaVersion` is post-upload accurate the moment `await room.ready()` returns. README adds a "Safe schema evolution" section.
+>
+> **v3.1 — one constructor break.** `RoomClient<TSchema>` infers value types from a schema map. The `schemas` constructor option groups server JSON Schema, client Standard Schema, and a numeric `version` for handshake-time registration. `reserve` accepts `SetOptions` (TTL). `RoomError.kind` exposes a discriminated union for ergonomic error handling. See [Migration notes](#migration-notes).
 
 ## Deploy the server
 
@@ -308,11 +310,23 @@ If you absolutely need to read past the cap on cold start, fall back to `room.li
 
 ```ts
 type ChangeEvent =
-  | { type: "set";    key: string; value: unknown; rev: number; originConnId: string | null }
-  | { type: "delete"; key: string;                  rev: number; originConnId: string | null };
+  | { type: "set";    key: string; value: unknown;           rev: number; originConnId: string | null }
+  | { type: "delete"; key: string; priorValue: unknown | null; rev: number; originConnId: string | null };
 ```
 
 `originConnId` identifies the connection that originated the change. It is `null` for HTTP, alarm-driven, and TTL-sweep changes. Compare with `room.connectionId` to detect self-writes.
+
+`priorValue` (since v3.2) is the last-known value of the key right before the delete — useful when you maintain derived state keyed by something other than the storage key (e.g. a `Set<userId>` derived from `presence/{connId}`):
+
+```ts
+const userIds = new Set<string>();
+room.subscribePrefix("presence/", (e) => {
+  if (e.type === "set"    && e.value?.userId)      userIds.add(e.value.userId);
+  if (e.type === "delete" && e.priorValue?.userId) userIds.delete(e.priorValue.userId);
+});
+```
+
+`priorValue` is `null` if the key was already absent at the time of the delete (or if the value really was `null`). The server populates it on every delete-driving code path (explicit `delete`, `delete_prefix`, `transact` delete, presence cleanup on disconnect, alarm-driven deletes, and TTL sweeps).
 
 ### Presence
 
@@ -344,6 +358,48 @@ A common pattern (and what you should reach for first) is to consolidate "is the
 - joining the two on the read side via `userId` in the presence value.
 
 This composes without a 10-second heartbeat loop on the client.
+
+#### Worked example: derived `Set<userId>` from `presence/`
+
+Multi-tab users can have several `presence/{connId}` rows mapped to the same `userId`. To maintain a `Set<userId>` of currently-online distinct users, lean on `priorValue` (v3.2) so the delete handler knows whose connection just dropped — without you keeping a side-map from `connId → userId`:
+
+```ts
+type PresenceValue = { connectedAt: number; userId?: string };
+
+const onlineUserIds = new Set<string>();
+const refCount = new Map<string, number>(); // userId → live conn count
+
+const { initial, unsubscribe } = await room.subscribeWithSnapshotPrefix<PresenceValue>(
+  "presence/",
+  (e) => {
+    if (e.type === "set") {
+      const uid = e.value.userId;
+      if (!uid) return;
+      refCount.set(uid, (refCount.get(uid) ?? 0) + 1);
+      onlineUserIds.add(uid);
+    } else {
+      const uid = e.priorValue?.userId;
+      if (!uid) return;
+      const next = (refCount.get(uid) ?? 1) - 1;
+      if (next <= 0) {
+        refCount.delete(uid);
+        onlineUserIds.delete(uid);
+      } else {
+        refCount.set(uid, next);
+      }
+    }
+  }
+);
+
+// Seed from the initial snapshot.
+for (const [, value] of Object.entries(initial.entries) as [string, PresenceValue][]) {
+  if (!value.userId) continue;
+  refCount.set(value.userId, (refCount.get(value.userId) ?? 0) + 1);
+  onlineUserIds.add(value.userId);
+}
+```
+
+The ref-count guards against "user closes one of their tabs" being interpreted as "user went offline" — only the last tab's delete evicts.
 
 ### `room.broadcast(channel, data)`
 
@@ -463,6 +519,17 @@ await client.reserve("meta", DEFAULT_META, { ttl });
 
 Patterns: exact keys (`"meta"`), prefixes (`"votes/"`, must end with `/`), or catch-all (`"*"`). Resolution: exact > longest prefix > `"*"` > `unknown`. Prefer a TypeScript `interface RoomSchema { … }` declaration — works as well as `type RoomSchema = { … }` (the constraint is `object`, not `Record<string, unknown>`).
 
+#### TS schema vs server JSON Schema are independent
+
+`RoomClient<TSchema>` and `schemas.server` are two separate maps that don't have to match. The TS one drives compile-time narrowing for handler values and method signatures; the server one drives runtime rejection of bad writes.
+
+It's normal — and often correct — to declare them with different keys:
+
+- Put `presence/` in your `TSchema` so `subscribePrefix("presence/", e => e.priorValue.userId)` types correctly. Don't put it in `schemas.server`: clients can't write `presence/` anyway, so server-side validation is moot.
+- Conversely, validate `votes/` server-side without bothering to add it to `TSchema` if it's only ever read by code that already knows the shape (e.g. an admin tally script).
+
+Mismatch is fine in either direction. The constraint is just that **for keys present in both**, the JSON Schema and the TypeScript type should describe the same structure — or your types lie about what hits the wire.
+
 ### Manual schema registration
 
 `room.registerSchemas` is still available for ad-hoc updates from a privileged client:
@@ -477,6 +544,35 @@ Schemas are **forward-only**: registration validates only future writes. Pre-exi
 
 If two clients (e.g. an old tab and a new tab during a rolling deploy) try to register schemas concurrently with overlapping versions, the second fails with `RoomError` carrying `kind: "schemaConflict"` and a `schemaConflict: { incomingVersion, currentVersion }` payload. The SDK silently tolerates this in its auto-register path — the racing tab won, and the new room state is what you intended anyway.
 
+### Safely evolving a schema
+
+`registerSchemas` is **forward-only**: registration only validates future writes. Pre-existing data is not re-validated, not quarantined, and continues to surface in `list`, `snapshot`, and `subscribe` results. So the safety of a schema change depends on whether old in-flight writes from old clients (during your rolling deploy window) and old data already in the store remain valid under the new schema.
+
+Two axes to think about — **structural** (what changed) and **strictness** (whether `additionalProperties` rejects the unexpected):
+
+| Change | Old data still valid? | Old client writes still valid? | Action |
+|---|---|---|---|
+| Add an optional field | Yes | Yes | Bump `version` (so the new schema lands), no other action |
+| Add a required field | **No** | **No** | Migrate first (read-validate-rewrite under `setIf({ ifRev })`), then bump `version` |
+| Drop a field, `additionalProperties: true` (default) | Yes | Yes | Bump `version`, optionally migrate to clean up later |
+| Drop a field, `additionalProperties: false` | **No** | **No** | Either keep `additionalProperties: true`, or migrate first then bump |
+| Tighten a constraint (`minLength`, narrower `enum`, …) | If existing data complies | If old clients write compliant values | Audit, then bump |
+| Loosen a constraint | Yes | Yes | Bump |
+| Rename a field | **No** | **No** | Two-step migration: add the new name as optional, migrate data, drop the old name in a later version |
+
+**The 2-step pattern for risky changes.** When you can't safely flip the schema in one shot:
+
+1. Bump `version: N` to a permissive intermediate (e.g. `additionalProperties: true`, both old and new field names accepted as optional).
+2. Migrate data with a one-shot script: read every key under the affected prefix, transform, write under `setIf({ ifRev })` to avoid clobbering concurrent writes.
+3. Bump `version: N+1` to the strict final shape.
+
+**Rolling-deploy window.** Between the moment the new code starts shipping and the moment every old tab has reloaded, both old and new clients are talking to the same room. Old clients pre-validate against the old `client` schemas (no problem) and write through. The server validates against whatever was last `register_schemas`'d. The auto-upload race resolves deterministically: the highest `version` wins, others get `schemaConflict` and back off. So:
+
+- **In-flight writes during the auto-upload window** (the few ms between connect and `register_schemas` ack): the old schema is still active, so anything an old client could legally write goes through. Nothing accumulates "validated against the wrong schema" — the validator that ran is exactly the one in effect at that instant.
+- **Data written by an old client after the upload completes**: must be valid under the new schema, or it's rejected. This is why "additive only" is the safe regime for rolling deploys; subtractive changes need the migration step before the bump.
+
+When in doubt: leave `additionalProperties: true` (the default), make changes additive, and migrate explicitly with `update`/`setIf` if you ever need to clean historical data.
+
 ---
 
 ## Connection lifecycle
@@ -486,12 +582,15 @@ If two clients (e.g. an old tab and a new tab during a rolling deploy) try to re
 ```ts
 room.status                 // current state
 room.connectionId           // string once "ready", null otherwise
+room.schemaVersion          // current room schema version (post-upload), null until ready
 
 const off = room.on("status", (s) => {
   document.getElementById("badge")!.textContent = s;
 });
 off();
 ```
+
+`await room.ready()` resolves once the auth handshake completes **and** any auto-schema-registration triggered by `schemas.version > server's` has settled (success or `schemaConflict` — the latter is silently tolerated). Since v3.2 you can read `room.schemaVersion` directly after `await room.ready()` and trust it reflects the post-upload state without polling.
 
 Subscriptions and in-flight ops are automatically restored when the socket reconnects. While reconnecting, new ops are queued and replayed on reconnect.
 
@@ -752,8 +851,8 @@ And `AlarmAction` is one of:
 { "op": "snapshot_initial",     "requestId": "abc", "kind": "key" | "prefix", "target": "…", "value": <any>, "rev": 7, "entries": {…} }
 { "op": "schemas_registered",   "requestId": "abc", "count": 3, "schemaVersion": 3 }
 
-{ "op": "change",               "type": "set",    "key": "k", "value": <any>, "rev": 8, "originConnId": "conn-id" | null }
-{ "op": "change",               "type": "delete", "key": "k",                  "rev": 9, "originConnId": "conn-id" | null }
+{ "op": "change",               "type": "set",    "key": "k", "value": <any>,                        "rev": 8, "originConnId": "conn-id" | null }
+{ "op": "change",               "type": "delete", "key": "k", "priorValue": <any> | null,            "rev": 9, "originConnId": "conn-id" | null }
 { "op": "change_batch",         "changes": [<change>, …] }
 
 { "op": "broadcast_recv",       "channel": "chat", "data": <any> }
@@ -770,6 +869,14 @@ And `AlarmAction` is one of:
 ---
 
 ## Migration notes
+
+### Upgrading from v3.1 to v3.2
+
+Fully additive — no consumer code needs to change.
+
+- **`delete` change events now carry `priorValue`.** The field is optional on the wire (`priorValue?: unknown`) and present on the typed event as `priorValue: V | null`. Existing handlers that only read `e.key`/`e.rev`/`e.originConnId` keep working unchanged. New consumers can subscribe to `presence/`-style namespaces and maintain derived state without a side-map. See [`ChangeEvent`](#changeevent) and the [presence-derived-set worked example](#worked-example-derived-setuserid-from-presence).
+- **`room.ready()` waits for auto-schema-registration to settle.** If `schemas.version` is higher than the server's current version, `await room.ready()` resolves only after the auto-`register_schemas` ack lands (or fails with `schemaConflict` — the SDK silently tolerates that and resolves anyway). `room.schemaVersion` is now post-upload accurate the moment `ready()` returns. Removes the diagnostic-foot-gun where `console.log(room.schemaVersion)` right after `ready` showed the pre-upload value for an event-loop tick.
+- **No wire-protocol breakage.** Older servers that don't include `priorValue` on the wire still work — `e.priorValue` falls back to `null`. Older clients that don't read `priorValue` continue to ignore it.
 
 ### Upgrading from v3.0 to v3.1
 

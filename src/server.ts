@@ -227,9 +227,17 @@ export default class RoomServer implements Party.Server {
 
       if (this.ready && state.authenticated) {
         const presenceKey = `presence/${conn.id}`;
+        const priorValue = await this.store.get(presenceKey);
         await this.store.delete(presenceKey);
         await this.bumpRev(presenceKey);
-        await this.notify({ op: "change", type: "delete", key: presenceKey, rev: await this.getRev(presenceKey), originConnId: conn.id });
+        await this.notify({
+          op: "change",
+          type: "delete",
+          key: presenceKey,
+          priorValue,
+          rev: await this.getRev(presenceKey),
+          originConnId: conn.id,
+        });
       }
     }
   }
@@ -254,12 +262,20 @@ export default class RoomServer implements Party.Server {
         ttlCursor = indexKey;
         const expiresAt = parseExpiryFromIndexKey(indexKey);
         if (expiresAt > now) break sweepLoop;
+        const priorValue = await this.store.get(userKey);
         await this.store.delete(userKey);
         await dos.delete(indexKey);
         await dos.delete(`${META_TTL}${userKey}`);
         await this.bumpRev(userKey);
         const rev = await this.getRev(userKey);
-        await this.notify({ op: "change", type: "delete", key: userKey, rev, originConnId: null });
+        await this.notify({
+          op: "change",
+          type: "delete",
+          key: userKey,
+          priorValue,
+          rev,
+          originConnId: null,
+        });
         swept++;
       }
       if (processed < 128) break;
@@ -384,11 +400,12 @@ export default class RoomServer implements Party.Server {
         if (key.startsWith(META) || key.startsWith("presence/")) {
           return cors(new Response("Reserved key prefix", { status: 400 }));
         }
+        const priorValue = await this.store.get(key);
         await this.store.delete(key);
         await this.clearTTL(key);
         await this.bumpRev(key);
         const rev = await this.getRev(key);
-        await this.notify({ op: "change", type: "delete", key, rev, originConnId: null });
+        await this.notify({ op: "change", type: "delete", key, priorValue, rev, originConnId: null });
         return cors(Response.json({ ok: true, rev }));
       }
     } catch (err) {
@@ -498,12 +515,20 @@ export default class RoomServer implements Party.Server {
           sendError(conn, "invalid", "Reserved key prefix", { requestId: msg.requestId });
           break;
         }
+        const priorValue = await this.store.get(msg.key);
         await this.store.delete(msg.key);
         await this.clearTTL(msg.key);
         await this.bumpRev(msg.key);
         const rev = await this.getRev(msg.key);
         send(conn, { op: "ack", requestId: msg.requestId });
-        await this.notify({ op: "change", type: "delete", key: msg.key, rev, originConnId: conn.id });
+        await this.notify({
+          op: "change",
+          type: "delete",
+          key: msg.key,
+          priorValue,
+          rev,
+          originConnId: conn.id,
+        });
         break;
       }
 
@@ -904,12 +929,20 @@ export default class RoomServer implements Party.Server {
           break;
         }
         case "delete": {
+          const priorValue = await this.store.get(op.key);
           await this.store.delete(op.key);
           await this.clearTTL(op.key, true);
           await this.bumpRev(op.key);
           const rev = await this.getRev(op.key);
           results.push({ op: "delete", key: op.key, rev });
-          changes.push({ op: "change", type: "delete", key: op.key, rev, originConnId: conn.id });
+          changes.push({
+            op: "change",
+            type: "delete",
+            key: op.key,
+            priorValue,
+            rev,
+            originConnId: conn.id,
+          });
           break;
         }
         case "increment": {
@@ -996,10 +1029,18 @@ export default class RoomServer implements Party.Server {
         break;
       }
       case "delete": {
+        const priorValue = await this.store.get(action.key);
         await this.store.delete(action.key);
         await this.bumpRev(action.key);
         const rev = await this.getRev(action.key);
-        await this.notify({ op: "change", type: "delete", key: action.key, rev, originConnId: null });
+        await this.notify({
+          op: "change",
+          type: "delete",
+          key: action.key,
+          priorValue,
+          rev,
+          originConnId: null,
+        });
         break;
       }
       case "increment": {
@@ -1128,8 +1169,8 @@ export default class RoomServer implements Party.Server {
       for (const k of keys) {
         if (k.startsWith(META)) continue;
         pageHadUserKeys = true;
+        const priorValue = page.entries[k];
         await this.store.delete(k);
-        // Per-key TTL cleanup, reschedule once at the end.
         const expiresAt = await dos.get<number>(`${META_TTL}${k}`);
         if (expiresAt !== undefined) {
           await dos.delete(`${META_TTL}${k}`);
@@ -1137,7 +1178,14 @@ export default class RoomServer implements Party.Server {
         }
         await this.bumpRev(k);
         const rev = await this.getRev(k);
-        await this.notify({ op: "change", type: "delete", key: k, rev, originConnId: sourceConnId });
+        await this.notify({
+          op: "change",
+          type: "delete",
+          key: k,
+          priorValue,
+          rev,
+          originConnId: sourceConnId,
+        });
         count++;
       }
 
@@ -1202,12 +1250,20 @@ export default class RoomServer implements Party.Server {
     const dos = this.party.storage as unknown as DurableObjectStorage;
     const expiresAt = await dos.get<number>(`${META_TTL}${key}`);
     if (expiresAt !== undefined && expiresAt <= Date.now()) {
+      const priorValue = await this.store.get(key);
       await this.store.delete(key);
       await dos.delete(`${META_TTL}${key}`);
       await dos.delete(buildTTLIndexKey(expiresAt, key));
       await this.bumpRev(key);
       const rev = await this.getRev(key);
-      await this.notify({ op: "change", type: "delete", key, rev, originConnId: sourceConnId });
+      await this.notify({
+        op: "change",
+        type: "delete",
+        key,
+        priorValue,
+        rev,
+        originConnId: sourceConnId,
+      });
       return null;
     }
     return this.store.get(key);

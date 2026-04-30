@@ -50,9 +50,8 @@ async function main() {
   });
   await client1.ready();
 
-  // Wait one tick for the auto-register handshake.
-  await new Promise((r) => setTimeout(r, 10));
-  check("auto-register sets schemaVersion", client1.schemaVersion === 1);
+  // v3.2: ready() must wait for auto-register, no polling needed.
+  check("ready() waits for auto-register (schemaVersion is post-upload)", client1.schemaVersion === 1);
 
   // Test 2: reserve with TTL goes through.
   const reserved = await client1.reserve("meta", { title: "Poll", version: 1 }, { ttl: 60 });
@@ -76,7 +75,7 @@ async function main() {
     },
   });
   await client2.ready();
-  await new Promise((r) => setTimeout(r, 10));
+  check("c2 ready() reflects current room schemaVersion", client2.schemaVersion === 1);
   // Trying to manually re-register at same version → schemaConflict.
   let conflictKind: string | null = null;
   try {
@@ -127,6 +126,54 @@ async function main() {
   }
   check("setIf with both ifValue+ifRev → kind=invalid", kindCheck === "invalid");
 
+  // Test 11: priorValue echoes on delete events.
+  resetMockRooms();
+  const a = new MockRoomClient<Schema>({ roomId: "r2", config: { apiKey: "k2", userId: "u1" } });
+  const b = new MockRoomClient<Schema>({ roomId: "r2", config: { apiKey: "k2" } });
+  await Promise.all([a.ready(), b.ready()]);
+
+  await a.set("votes/v1", { voterId: "u1", option: "A" });
+
+  // priorValue on explicit delete
+  let deletedPrior: unknown = "untouched";
+  const offDelete = b.subscribePrefix("votes/", (e) => {
+    if (e.type === "delete" && e.key === "votes/v1") deletedPrior = e.priorValue;
+  });
+  await a.delete("votes/v1");
+  await new Promise((r) => setTimeout(r, 10));
+  check(
+    "priorValue echoes on explicit delete",
+    typeof deletedPrior === "object" && deletedPrior !== null &&
+    (deletedPrior as Vote).voterId === "u1" && (deletedPrior as Vote).option === "A"
+  );
+  offDelete();
+
+  // priorValue on presence/ delete (the headline use case)
+  // Add a third client with a userId so we can assert userId echoes through.
+  const c = new MockRoomClient<Schema>({
+    roomId: "r2",
+    config: { apiKey: "k2", userId: "alice" },
+  });
+  await c.ready();
+
+  const cConnId = c.connectionId;
+  let presencePrior: unknown = "untouched";
+  const offPres = a.subscribePrefix("presence/", (e) => {
+    if (e.type === "delete" && e.key === `presence/${cConnId}`) {
+      presencePrior = e.priorValue;
+    }
+  });
+  c.disconnect();
+  await new Promise((r) => setTimeout(r, 20));
+  check(
+    "priorValue carries userId on presence/ delete",
+    !!presencePrior && (presencePrior as { userId?: string }).userId === "alice"
+  );
+  offPres();
+  a.disconnect();
+  b.disconnect();
+
+  resetMockRooms();
   client1.disconnect();
   client2.disconnect();
   resetMockRooms();

@@ -119,10 +119,11 @@ class MockRoom {
     rev: number,
     originConnId: string | null
   ) {
+    // For "delete" the third arg is the prior value; for "set" it's the new value.
     const event: ChangeEvent =
       type === "set"
         ? { type: "set", key, value, rev, originConnId }
-        : { type: "delete", key, rev, originConnId };
+        : { type: "delete", key, priorValue: value ?? null, rev, originConnId };
 
     for (const conn of this.connections) {
       const isSource = originConnId !== null && conn.id === originConnId;
@@ -196,9 +197,10 @@ class MockRoom {
         break;
       }
       case "delete": {
+        const priorValue = await this.store.get(action.key);
         await this.store.delete(action.key);
         const rev = this.bumpRev(action.key);
-        await this.notifyChange("delete", action.key, null, rev, null);
+        await this.notifyChange("delete", action.key, priorValue, rev, null);
         break;
       }
       case "increment": {
@@ -225,9 +227,10 @@ class MockRoom {
     this.clearTTL(key);
     const timer = setTimeout(async () => {
       this.ttlTimers.delete(key);
+      const priorValue = await this.store.get(key);
       await this.store.delete(key);
       const rev = this.bumpRev(key);
-      await this.notifyChange("delete", key, null, rev, null);
+      await this.notifyChange("delete", key, priorValue, rev, null);
     }, ttlSeconds * 1000);
     this.ttlTimers.set(key, timer);
   }
@@ -322,8 +325,10 @@ export class MockRoomClient<S extends RoomSchemaMap = RoomSchemaMap>
       await this.room.store.set(presenceKey, presenceValue);
       const rev = this.room.bumpRev(presenceKey);
       await this.room.notifyChange("set", presenceKey, presenceValue, rev, this._connectionId);
+      // Auto-register schemas before flipping to "ready", so consumers awaiting
+      // ready() see the post-upload `schemaVersion` rather than the pre-upload one.
+      await this.maybeRegisterServerSchemas();
       this.setStatus("ready");
-      void this.maybeRegisterServerSchemas();
     });
   }
 
@@ -412,10 +417,11 @@ export class MockRoomClient<S extends RoomSchemaMap = RoomSchemaMap>
   async delete(key: string): Promise<SetResult> {
     this.assertOpen();
     this.assertWritable(key);
+    const priorValue = await this.room.store.get(key);
     await this.room.store.delete(key);
     this.room.clearTTL(key);
     const rev = this.room.bumpRev(key);
-    await this.room.notifyChange("delete", key, null, rev, this._connectionId);
+    await this.room.notifyChange("delete", key, priorValue, rev, this._connectionId);
     return { rev };
   }
 
@@ -544,10 +550,11 @@ export class MockRoomClient<S extends RoomSchemaMap = RoomSchemaMap>
       const keys = Object.keys(page.entries);
       for (const k of keys) {
         if (k.startsWith(META)) continue;
+        const priorValue = page.entries[k];
         await this.room.store.delete(k);
         this.room.clearTTL(k);
         const rev = this.room.bumpRev(k);
-        await this.room.notifyChange("delete", k, null, rev, this._connectionId);
+        await this.room.notifyChange("delete", k, priorValue, rev, this._connectionId);
         deleted++;
       }
       if (!page.nextCursor) break;
@@ -668,11 +675,12 @@ export class MockRoomClient<S extends RoomSchemaMap = RoomSchemaMap>
           break;
         }
         case "delete": {
+          const priorValue = await this.room.store.get(op.key);
           await this.room.store.delete(op.key);
           this.room.clearTTL(op.key);
           const rev = this.room.bumpRev(op.key);
           results.push({ op: "delete", key: op.key, rev });
-          changes.push({ type: "delete", key: op.key, value: null, rev });
+          changes.push({ type: "delete", key: op.key, value: priorValue, rev });
           break;
         }
         case "increment": {
@@ -892,10 +900,12 @@ export class MockRoomClient<S extends RoomSchemaMap = RoomSchemaMap>
     this.room.connections.delete(this.conn);
     const presenceKey = `presence/${this._connectionId}`;
     const connId = this._connectionId;
-    void this.room.store.delete(presenceKey).then(() => {
+    void (async () => {
+      const priorValue = await this.room.store.get(presenceKey);
+      await this.room.store.delete(presenceKey);
       const rev = this.room.bumpRev(presenceKey);
-      return this.room.notifyChange("delete", presenceKey, null, rev, connId);
-    });
+      await this.room.notifyChange("delete", presenceKey, priorValue, rev, connId);
+    })();
     this.setStatus("closed");
   }
 
