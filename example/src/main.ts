@@ -48,19 +48,6 @@ connectBtn.addEventListener("click", async () => {
 
   client = new RoomClient({ host, roomId, config: { apiKey, persistence } });
 
-  // Subscribe to all keys, including our own writes — the server is the single
-  // source of truth; we never write to the local mirror directly.
-  client.subscribePrefix("", (e) => {
-    if (e.type === "delete") {
-      kvStore.delete(e.key);
-    } else {
-      kvStore.set(e.key, e.value);
-    }
-    renderKv();
-    flashEntry(e.key);
-  }, { includeSelf: true });
-
-  // Receive chat messages.
   client.onBroadcast("chat", (data) => {
     const d = data as { nick: string; text: string };
     appendMessage(d.nick, d.text, false);
@@ -75,9 +62,19 @@ connectBtn.addEventListener("click", async () => {
     return;
   }
 
-  // Hydrate local mirror from server.
-  const existing = await client.list("");
-  for (const [k, v] of Object.entries(existing.entries)) kvStore.set(k, v);
+  // Atomic subscribe + initial state. Server delivers the snapshot before any
+  // change events, so there's no bootstrap race.
+  const { initial } = await client.subscribeWithSnapshotPrefix(
+    "",
+    (e) => {
+      if (e.type === "delete") kvStore.delete(e.key);
+      else                     kvStore.set(e.key, e.value);
+      renderKv();
+      flashEntry(e.key);
+    },
+    { includeSelf: true }
+  );
+  for (const [k, v] of Object.entries(initial.entries)) kvStore.set(k, v);
   renderKv();
 
   setStatus(true);

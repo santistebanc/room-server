@@ -98,6 +98,6 @@ export function createStore(
   level: PersistenceLevel,
   storage: DurableObjectStorage
 ): Store {
-  if (level === "storage") return new DOStore(storage);
+  if (level === "durable") return new DOStore(storage);
   return new MemoryStore();
 }

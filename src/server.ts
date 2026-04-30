@@ -1,26 +1,63 @@
 import type * as Party from "partykit/server";
 import type { DurableObjectStorage } from "@cloudflare/workers-types";
 import { createStore, type Store } from "./persistence.js";
+import { resolveSchema, validate } from "./validator.js";
 import type {
   AlarmAction,
+  ChangeMsg,
   ClientMsg,
   Env,
+  JsonSchema,
   PersistenceLevel,
   RateLimitInfo,
   ServerMsg,
+  TransactOp,
+  TransactOpResult,
+  ValidationErrorDetail,
 } from "./types.js";
 
 // Internal storage key prefix — never exposed to clients via list().
 const META = "__rs/";
+const META_REV = `${META}rev/`;
+const META_TTL = `${META}ttl/`;                     // key -> expiresAt
+const META_TTL_BY_EXPIRY = `${META}ttlByExpiry/`;   // padded(expiresAt)-key -> key
+const META_SCHEMAS = `${META}schemas`;
+const META_PERSISTENCE = `${META}persistence`;
+const META_APP_ID = `${META}appId`;
+const META_ROOM_ID = `${META}roomId`;
+const META_ALARM_FIRE_AT = `${META}alarm/fireAt`;
+const META_ALARM_ACTION = `${META}alarm/action`;
+const META_ALARM_RECURRING = `${META}alarm/recurring`;
 
-// Per-connection subscription state.
-//   - keys:     exact-key subscriptions, target -> { includeSelf }.
-//   - prefixes: prefix subscriptions,    target -> { includeSelf }.
-// A subscribing client may overwrite includeSelf by re-sending subscribe with
-// a different value; unsubscribe removes the entry regardless of includeSelf.
+// Soft cap for unbounded list/snapshot operations. Beyond this we set
+// `truncated: true` and stop. Tunable in the future.
+const LIST_HARD_CAP = 10_000;
+const COUNT_HARD_CAP = 100_000;
+
+// ── Per-connection state ──────────────────────────────────────────────────────
+
+interface SubState {
+  includeSelf: boolean;
+  batchMs?: number;
+}
+
 interface ConnSubs {
-  keys: Map<string, { includeSelf: boolean }>;
-  prefixes: Map<string, { includeSelf: boolean }>;
+  keys: Map<string, SubState>;
+  prefixes: Map<string, SubState>;
+}
+
+interface BatchBucket {
+  changes: ChangeMsg[];
+  timer: ReturnType<typeof setTimeout> | null;
+}
+
+interface ConnState {
+  authenticated: boolean;
+  appId?: string;
+  userId?: string;
+  authTimeout: ReturnType<typeof setTimeout> | null;
+  subs: ConnSubs;
+  batchBuckets: Map<number /*batchMs*/, BatchBucket>;
 }
 
 interface RateBucket {
@@ -41,7 +78,10 @@ export default class RoomServer implements Party.Server {
   private ready = false;
   private initPromise: Promise<void> | null = null;
 
-  private subscriptions = new Map<string, ConnSubs>();
+  // Schemas registered in this room. Keyed by pattern (prefix-with-/, exact key, or "*").
+  private schemas: Record<string, JsonSchema> = {};
+
+  private connections = new Map<string, ConnState>();
 
   private rateLimits = new Map<string, RateBucket>();
   private httpRateLimits = new Map<string, RateBucket>();
@@ -49,6 +89,7 @@ export default class RoomServer implements Party.Server {
   private rateLimitWindowMs = 10_000;
   private maxConnections = 100;
   private connectionCount = 0;
+  private authTimeoutMs = 10_000;
 
   constructor(private party: Party.Room) {}
 
@@ -59,11 +100,12 @@ export default class RoomServer implements Party.Server {
     if (env.RATE_LIMIT_OPS) this.rateLimitOps = parseInt(env.RATE_LIMIT_OPS, 10);
     if (env.RATE_LIMIT_WINDOW) this.rateLimitWindowMs = parseInt(env.RATE_LIMIT_WINDOW, 10) * 1000;
     if (env.MAX_CONNECTIONS) this.maxConnections = parseInt(env.MAX_CONNECTIONS, 10);
+    if (env.AUTH_TIMEOUT) this.authTimeoutMs = parseInt(env.AUTH_TIMEOUT, 10) * 1000;
 
     const dos = this.party.storage as unknown as DurableObjectStorage;
-    const savedPersistence = await dos.get<PersistenceLevel>(`${META}persistence`);
-    const savedAppId = await dos.get<string>(`${META}appId`);
-    const savedRoomId = await dos.get<string>(`${META}roomId`);
+    const savedPersistence = await dos.get<PersistenceLevel>(META_PERSISTENCE);
+    const savedAppId = await dos.get<string>(META_APP_ID);
+    const savedRoomId = await dos.get<string>(META_ROOM_ID);
 
     if (savedPersistence && savedAppId && savedRoomId) {
       this.persistence = savedPersistence;
@@ -73,81 +115,61 @@ export default class RoomServer implements Party.Server {
       await this.store.hydrate();
       this.ready = true;
 
-      // Restore connection count and prune presence keys left by a hard crash.
-      // On hibernation wakeup, live connections are preserved and their presence
-      // keys are valid. On crash, connections drop and old presence keys are orphaned.
+      const savedSchemas = await dos.get<Record<string, JsonSchema>>(META_SCHEMAS);
+      if (savedSchemas) this.schemas = savedSchemas;
+
       const liveConnections = [...this.party.getConnections()];
       this.connectionCount = liveConnections.length;
       for (const conn of liveConnections) {
-        this.subscriptions.set(conn.id, emptyConnSubs());
+        // Pre-hibernation connections were already authenticated. Re-create state.
+        this.connections.set(conn.id, this.createAuthedConnState());
       }
       const liveIds = new Set(liveConnections.map((c) => c.id));
 
+      // Prune presence keys belonging to connections that didn't survive.
       let presenceCursor: string | undefined;
       do {
-        const presencePage = await this.store.list("presence/", 100, presenceCursor);
-        for (const key of Object.keys(presencePage.entries)) {
+        const page = await this.store.list("presence/", 100, presenceCursor);
+        for (const key of Object.keys(page.entries)) {
           const connId = key.slice("presence/".length);
           if (!liveIds.has(connId)) await this.store.delete(key);
         }
-        presenceCursor = presencePage.nextCursor;
+        presenceCursor = page.nextCursor;
       } while (presenceCursor);
     }
   }
 
-  async onConnect(conn: Party.Connection, ctx: Party.ConnectionContext) {
-    const url = new URL(ctx.request.url);
-    const apiKey = url.searchParams.get("apiKey") ?? "";
-    const persistence =
-      (url.searchParams.get("persistence") as PersistenceLevel | null) ?? "storage";
-
-    const authResult = this.authenticate(apiKey, this.party.env as Env);
-    if (!authResult.ok) {
-      send(conn, { op: "error", message: authResult.reason });
-      conn.close(4001, "Unauthorized");
-      return;
-    }
-
+  async onConnect(conn: Party.Connection) {
     if (this.connectionCount >= this.maxConnections) {
       send(conn, { op: "error", message: "Room connection limit reached" });
       conn.close(4002, "Connection limit reached");
       return;
     }
 
-    // Increment before the await so concurrent onConnect calls can't both
-    // pass the limit check and overshoot maxConnections.
     this.connectionCount++;
-    this.subscriptions.set(conn.id, emptyConnSubs());
 
-    await this.ensureInit(authResult.appId, persistence);
-
-    const presenceKey = `presence/${conn.id}`;
-    const presenceValue = { connectedAt: Date.now() };
-    await this.store.set(presenceKey, presenceValue);
-    this.notifySet(presenceKey, presenceValue, conn.id);
-
-    send(conn, {
-      op: "ready",
-      persistence: this.persistence,
-      appId: this.appId,
-      roomId: this.roomId,
-      connectionId: conn.id,
-    });
+    const state: ConnState = {
+      authenticated: false,
+      authTimeout: setTimeout(() => {
+        const c = this.party.getConnection(conn.id);
+        if (c) {
+          send(c, { op: "error", message: "Auth timeout" });
+          c.close(4003, "Auth timeout");
+        }
+      }, this.authTimeoutMs),
+      subs: { keys: new Map(), prefixes: new Map() },
+      batchBuckets: new Map(),
+    };
+    this.connections.set(conn.id, state);
   }
 
   async onMessage(message: string | ArrayBuffer, conn: Party.Connection) {
-    if (!this.ready) {
-      send(conn, { op: "error", message: "Room not initialized" });
-      return;
-    }
+    const state = this.connections.get(conn.id);
+    if (!state) return;
 
     const rate = this.checkRateLimit(conn.id);
     if (!rate.allowed) {
-      send(conn, {
-        op: "error",
-        message: "Rate limit exceeded",
-        rateLimit: toRateLimitInfo(rate),
-      });
+      send(conn, { op: "error", message: "Rate limit exceeded", rateLimit: toRateLimitInfo(rate) });
       return;
     }
     this.maybeWarnRateLimit(conn, conn.id, rate);
@@ -163,7 +185,20 @@ export default class RoomServer implements Party.Server {
     }
 
     try {
-      await this.handle(msg, conn);
+      if (!state.authenticated) {
+        if (msg.op !== "auth") {
+          send(conn, {
+            op: "error",
+            requestId: (msg as { requestId?: string }).requestId,
+            message: "Auth required — send {op:'auth',apiKey,userId?,persistence?} as the first message",
+          });
+          return;
+        }
+        await this.handleAuth(msg, conn, state);
+        return;
+      }
+
+      await this.handle(msg, conn, state);
     } catch (err) {
       send(conn, {
         op: "error",
@@ -174,16 +209,23 @@ export default class RoomServer implements Party.Server {
   }
 
   async onClose(conn: Party.Connection) {
-    // Only decrement if this connection was actually accepted (i.e. made it past auth/limit checks).
-    const wasAccepted = this.subscriptions.has(conn.id);
-    this.subscriptions.delete(conn.id);
+    const state = this.connections.get(conn.id);
+    this.connections.delete(conn.id);
     this.rateLimits.delete(conn.id);
-    if (wasAccepted) this.connectionCount = Math.max(0, this.connectionCount - 1);
 
-    if (this.ready) {
-      const presenceKey = `presence/${conn.id}`;
-      await this.store.delete(presenceKey);
-      this.notifyDelete(presenceKey, conn.id);
+    if (state) {
+      if (state.authTimeout) clearTimeout(state.authTimeout);
+      for (const bucket of state.batchBuckets.values()) {
+        if (bucket.timer) clearTimeout(bucket.timer);
+      }
+      this.connectionCount = Math.max(0, this.connectionCount - 1);
+
+      if (this.ready && state.authenticated) {
+        const presenceKey = `presence/${conn.id}`;
+        await this.store.delete(presenceKey);
+        await this.bumpRev(presenceKey);
+        await this.notify({ op: "change", type: "delete", key: presenceKey, rev: await this.getRev(presenceKey), originConnId: conn.id });
+      }
     }
   }
 
@@ -192,53 +234,60 @@ export default class RoomServer implements Party.Server {
     const dos = this.party.storage as unknown as DurableObjectStorage;
     const now = Date.now();
 
-    // 1. Sweep expired TTL keys (paginate — DO storage returns max 128 per call).
+    // 1. Sweep expired TTLs via the sorted-by-expiry index. Stops at first non-expired.
     let ttlCursor: string | undefined;
-    do {
-      const ttlPage = await dos.list<number>({ prefix: `${META}ttl/`, startAfter: ttlCursor });
-      for (const [ttlKey, expiresAt] of ttlPage) {
-        if (expiresAt <= now) {
-          const key = ttlKey.slice(`${META}ttl/`.length);
-          await this.store.delete(key);
-          await dos.delete(ttlKey);
-          this.notifyDelete(key, null);
-        }
-        ttlCursor = ttlKey;
+    let swept = 0;
+    sweepLoop: while (true) {
+      const page = await dos.list<string>({
+        prefix: META_TTL_BY_EXPIRY,
+        startAfter: ttlCursor,
+        limit: 128,
+      });
+      let processed = 0;
+      for (const [indexKey, userKey] of page) {
+        processed++;
+        ttlCursor = indexKey;
+        const expiresAt = parseExpiryFromIndexKey(indexKey);
+        if (expiresAt > now) break sweepLoop;
+        await this.store.delete(userKey);
+        await dos.delete(indexKey);
+        await dos.delete(`${META_TTL}${userKey}`);
+        await this.bumpRev(userKey);
+        const rev = await this.getRev(userKey);
+        await this.notify({ op: "change", type: "delete", key: userKey, rev, originConnId: null });
+        swept++;
       }
-      if (ttlPage.size < 128) break;
-    } while (true);
+      if (processed < 128) break;
+    }
 
-    // 2. Execute one-shot alarm if its scheduled time has arrived.
-    const fireAt = await dos.get<number>(`${META}alarm/fireAt`);
-    const alarmAction = await dos.get<AlarmAction>(`${META}alarm/action`);
+    // 2. One-shot alarm.
+    const fireAt = await dos.get<number>(META_ALARM_FIRE_AT);
+    const alarmAction = await dos.get<AlarmAction>(META_ALARM_ACTION);
     if (fireAt && fireAt <= now) {
       if (alarmAction) {
         try { await this.executeAction(alarmAction); } catch {}
       }
-      await dos.delete(`${META}alarm/fireAt`);
-      await dos.delete(`${META}alarm/action`);
+      await dos.delete(META_ALARM_FIRE_AT);
+      await dos.delete(META_ALARM_ACTION);
     }
 
-    // 3. Execute recurring action only when its own scheduled time has arrived.
+    // 3. Recurring.
     const recurring = await dos.get<{ interval: number; action: AlarmAction; nextAt: number }>(
-      `${META}alarm/recurring`
+      META_ALARM_RECURRING
     );
     if (recurring && (recurring.nextAt ?? 0) <= now) {
       try { await this.executeAction(recurring.action); } catch {}
-      await dos.put(`${META}alarm/recurring`, {
+      await dos.put(META_ALARM_RECURRING, {
         ...recurring,
         nextAt: now + recurring.interval * 1000,
       });
     }
 
     await this.rescheduleNextAlarm(dos);
+    void swept; // silence unused-var if we ever drop the count
   }
 
   // ── HTTP REST API ───────────────────────────────────────────────────────────
-  // GET  /parties/room/{id}?key=path        → { key, value }
-  // GET  /parties/room/{id}?prefix=p&limit=N&cursor=C → { entries, nextCursor }
-  // POST /parties/room/{id}  body: { key, value, ttl? } → { ok }
-  // DELETE /parties/room/{id}?key=path      → { ok }
 
   async onRequest(req: Party.Request): Promise<Response> {
     if (req.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
@@ -270,7 +319,7 @@ export default class RoomServer implements Party.Server {
     }
 
     if (!this.ready) {
-      await this.ensureInit(authResult.appId, "storage");
+      await this.ensureInit(authResult.appId, "durable");
     }
 
     try {
@@ -281,9 +330,10 @@ export default class RoomServer implements Party.Server {
         const cursor = url.searchParams.get("cursor") ?? undefined;
 
         if (key !== null) {
-          if (key.startsWith(META)) return cors(Response.json({ key, value: null }));
+          if (key.startsWith(META)) return cors(Response.json({ key, value: null, rev: 0 }));
           const value = await this.getWithTTLCheck(key, null);
-          return cors(Response.json({ key, value }));
+          const rev = await this.getRev(key);
+          return cors(Response.json({ key, value, rev }));
         }
 
         if (prefix !== null) {
@@ -299,33 +349,42 @@ export default class RoomServer implements Party.Server {
       }
 
       if (req.method === "POST") {
-        const body = (await req.json()) as {
-          key: unknown;
-          value: unknown;
-          ttl?: number;
-        };
-        if (typeof body.key !== "string" || !body.key)
+        const body = (await req.json()) as { key: unknown; value: unknown; ttl?: number };
+        if (typeof body.key !== "string" || !body.key) {
           return cors(new Response("Missing or invalid key", { status: 400 }));
-        if (!("value" in (body as object)))
+        }
+        if (!("value" in (body as object))) {
           return cors(new Response("Missing value", { status: 400 }));
-        if (body.key.startsWith(META) || body.key.startsWith("presence/"))
+        }
+        if (body.key.startsWith(META) || body.key.startsWith("presence/")) {
           return cors(new Response("Reserved key prefix", { status: 400 }));
+        }
+        const errs = this.validateWrite(body.key, body.value);
+        if (errs) {
+          return cors(Response.json({ error: "Validation failed", validationError: errs }, { status: 400 }));
+        }
         await this.store.set(body.key, body.value);
-        await this.clearTTL(body.key, !!body.ttl);
+        await this.clearTTL(body.key, true);
         if (body.ttl) await this.scheduleTTL(body.key, body.ttl);
-        this.notifySet(body.key, body.value, null);
-        return cors(Response.json({ ok: true }));
+        await this.rescheduleNextAlarm(this.party.storage as unknown as DurableObjectStorage);
+        await this.bumpRev(body.key);
+        const rev = await this.getRev(body.key);
+        await this.notify({ op: "change", type: "set", key: body.key, value: body.value, rev, originConnId: null });
+        return cors(Response.json({ ok: true, rev }));
       }
 
       if (req.method === "DELETE") {
         const key = url.searchParams.get("key");
         if (!key) return cors(new Response("Missing key", { status: 400 }));
-        if (key.startsWith(META) || key.startsWith("presence/"))
+        if (key.startsWith(META) || key.startsWith("presence/")) {
           return cors(new Response("Reserved key prefix", { status: 400 }));
+        }
         await this.store.delete(key);
         await this.clearTTL(key);
-        this.notifyDelete(key, null);
-        return cors(Response.json({ ok: true }));
+        await this.bumpRev(key);
+        const rev = await this.getRev(key);
+        await this.notify({ op: "change", type: "delete", key, rev, originConnId: null });
+        return cors(Response.json({ ok: true, rev }));
       }
     } catch (err) {
       return cors(
@@ -339,30 +398,92 @@ export default class RoomServer implements Party.Server {
     return cors(new Response("Method not allowed", { status: 405 }));
   }
 
-  // ── Message handling ────────────────────────────────────────────────────────
+  // ── Auth handler ────────────────────────────────────────────────────────────
 
-  private async handle(msg: ClientMsg, conn: Party.Connection) {
+  private async handleAuth(
+    msg: Extract<ClientMsg, { op: "auth" }>,
+    conn: Party.Connection,
+    state: ConnState
+  ) {
+    const env = this.party.env as Env;
+    const authResult = this.authenticate(msg.apiKey, env);
+    if (!authResult.ok) {
+      send(conn, { op: "error", requestId: msg.requestId, message: authResult.reason });
+      conn.close(4001, "Unauthorized");
+      return;
+    }
+
+    if (state.authTimeout) {
+      clearTimeout(state.authTimeout);
+      state.authTimeout = null;
+    }
+    state.authenticated = true;
+    state.appId = authResult.appId;
+    state.userId = msg.userId;
+
+    await this.ensureInit(authResult.appId, msg.persistence ?? "durable");
+
+    const presenceKey = `presence/${conn.id}`;
+    const presenceValue: Record<string, unknown> = { connectedAt: Date.now() };
+    if (msg.userId) presenceValue["userId"] = msg.userId;
+    await this.store.set(presenceKey, presenceValue);
+    await this.bumpRev(presenceKey);
+    const presenceRev = await this.getRev(presenceKey);
+    await this.notify({
+      op: "change",
+      type: "set",
+      key: presenceKey,
+      value: presenceValue,
+      rev: presenceRev,
+      originConnId: conn.id,
+    });
+
+    send(conn, {
+      op: "ready",
+      persistence: this.persistence,
+      appId: this.appId,
+      roomId: this.roomId,
+      connectionId: conn.id,
+    });
+  }
+
+  // ── Authenticated message dispatch ──────────────────────────────────────────
+
+  private async handle(msg: ClientMsg, conn: Party.Connection, state: ConnState) {
     switch (msg.op) {
+      case "auth":
+        send(conn, { op: "error", requestId: msg.requestId, message: "Already authenticated" });
+        break;
+
       case "set": {
         if (msg.key.startsWith(META) || msg.key.startsWith("presence/")) {
           send(conn, { op: "error", requestId: msg.requestId, message: "Reserved key prefix" });
           break;
         }
+        const errs = this.validateWrite(msg.key, msg.value);
+        if (errs) {
+          send(conn, { op: "error", requestId: msg.requestId, message: "Validation failed", validationError: errs });
+          break;
+        }
         await this.store.set(msg.key, msg.value);
-        await this.clearTTL(msg.key, !!msg.ttl);
+        await this.clearTTL(msg.key, true);
         if (msg.ttl) await this.scheduleTTL(msg.key, msg.ttl);
+        await this.rescheduleNextAlarm(this.party.storage as unknown as DurableObjectStorage);
+        await this.bumpRev(msg.key);
+        const rev = await this.getRev(msg.key);
         send(conn, { op: "ack", requestId: msg.requestId });
-        this.notifySet(msg.key, msg.value, conn.id);
+        await this.notify({ op: "change", type: "set", key: msg.key, value: msg.value, rev, originConnId: conn.id });
         break;
       }
 
       case "get": {
         if (msg.key.startsWith(META)) {
-          send(conn, { op: "result", requestId: msg.requestId, key: msg.key, value: null });
+          send(conn, { op: "result", requestId: msg.requestId, key: msg.key, value: null, rev: 0 });
           break;
         }
         const value = await this.getWithTTLCheck(msg.key, conn.id);
-        send(conn, { op: "result", requestId: msg.requestId, key: msg.key, value });
+        const rev = await this.getRev(msg.key);
+        send(conn, { op: "result", requestId: msg.requestId, key: msg.key, value, rev });
         break;
       }
 
@@ -373,8 +494,10 @@ export default class RoomServer implements Party.Server {
         }
         await this.store.delete(msg.key);
         await this.clearTTL(msg.key);
+        await this.bumpRev(msg.key);
+        const rev = await this.getRev(msg.key);
         send(conn, { op: "ack", requestId: msg.requestId });
-        this.notifyDelete(msg.key, conn.id);
+        await this.notify({ op: "change", type: "delete", key: msg.key, rev, originConnId: conn.id });
         break;
       }
 
@@ -386,6 +509,19 @@ export default class RoomServer implements Party.Server {
           prefix: msg.prefix,
           entries: result.entries,
           nextCursor: result.nextCursor,
+          truncated: result.truncated,
+        });
+        break;
+      }
+
+      case "count": {
+        const result = await this.countUserKeys(msg.prefix);
+        send(conn, {
+          op: "count_result",
+          requestId: msg.requestId,
+          prefix: msg.prefix,
+          count: result.count,
+          truncated: result.truncated,
         });
         break;
       }
@@ -398,9 +534,16 @@ export default class RoomServer implements Party.Server {
         const current = await this.getWithTTLCheck(msg.key, conn.id);
         const num = typeof current === "number" ? current : 0;
         const next = num + (msg.delta ?? 1);
+        const errs = this.validateWrite(msg.key, next);
+        if (errs) {
+          send(conn, { op: "error", requestId: msg.requestId, message: "Validation failed", validationError: errs });
+          break;
+        }
         await this.store.set(msg.key, next);
-        send(conn, { op: "result", requestId: msg.requestId, key: msg.key, value: next });
-        this.notifySet(msg.key, next, conn.id);
+        await this.bumpRev(msg.key);
+        const rev = await this.getRev(msg.key);
+        send(conn, { op: "result", requestId: msg.requestId, key: msg.key, value: next, rev });
+        await this.notify({ op: "change", type: "set", key: msg.key, value: next, rev, originConnId: conn.id });
         break;
       }
 
@@ -409,18 +552,30 @@ export default class RoomServer implements Party.Server {
           send(conn, { op: "error", requestId: msg.requestId, message: "Reserved key prefix" });
           break;
         }
-        const current = await this.getWithTTLCheck(msg.key, conn.id);
-        const match = deepEqual(current, msg.ifValue);
-        if (match) {
-          await this.store.set(msg.key, msg.value);
-          this.notifySet(msg.key, msg.value, conn.id);
+        if (msg.ifValue !== undefined && msg.ifRev !== undefined) {
+          send(conn, { op: "error", requestId: msg.requestId, message: "Pass either ifValue or ifRev, not both" });
+          break;
         }
-        send(conn, {
-          op: "set_if_result",
-          requestId: msg.requestId,
-          success: match,
-          current,
-        });
+        const current = await this.getWithTTLCheck(msg.key, conn.id);
+        const currentRev = await this.getRev(msg.key);
+        let match: boolean;
+        if (msg.ifRev !== undefined) match = currentRev === msg.ifRev;
+        else                         match = deepEqual(current, msg.ifValue);
+
+        if (match) {
+          const errs = this.validateWrite(msg.key, msg.value);
+          if (errs) {
+            send(conn, { op: "error", requestId: msg.requestId, message: "Validation failed", validationError: errs });
+            break;
+          }
+          await this.store.set(msg.key, msg.value);
+          await this.bumpRev(msg.key);
+          const newRev = await this.getRev(msg.key);
+          send(conn, { op: "set_if_result", requestId: msg.requestId, success: true, current, rev: newRev });
+          await this.notify({ op: "change", type: "set", key: msg.key, value: msg.value, rev: newRev, originConnId: conn.id });
+        } else {
+          send(conn, { op: "set_if_result", requestId: msg.requestId, success: false, current, rev: currentRev });
+        }
         break;
       }
 
@@ -433,16 +588,9 @@ export default class RoomServer implements Party.Server {
           send(conn, { op: "error", requestId: msg.requestId, message: "ttl must be > 0" });
           break;
         }
-        // Touch only refreshes TTL on keys that have a value. The store's get()
-        // collapses missing-key and stored-null to null, so touch on null-valued
-        // keys is rejected too.
         const current = await this.store.get(msg.key);
         if (current === null || current === undefined) {
-          send(conn, {
-            op: "error",
-            requestId: msg.requestId,
-            message: "Cannot touch key (does not exist or is null)",
-          });
+          send(conn, { op: "error", requestId: msg.requestId, message: "Cannot touch key (does not exist or is null)" });
           break;
         }
         await this.scheduleTTL(msg.key, msg.ttl);
@@ -451,111 +599,131 @@ export default class RoomServer implements Party.Server {
       }
 
       case "delete_prefix": {
-        if (
-          msg.prefix.startsWith(META) ||
-          msg.prefix.startsWith("presence/") ||
-          msg.prefix === ""
-        ) {
+        if (msg.prefix === "" || msg.prefix.startsWith(META) || msg.prefix.startsWith("presence/")) {
           send(conn, {
             op: "error",
             requestId: msg.requestId,
-            message:
-              msg.prefix === ""
-                ? "delete_prefix requires a non-empty prefix"
-                : "Reserved key prefix",
+            message: msg.prefix === ""
+              ? "delete_prefix requires a non-empty prefix"
+              : "Reserved key prefix",
           });
           break;
         }
         const deleted = await this.deletePrefix(msg.prefix, conn.id);
-        send(conn, {
-          op: "delete_prefix_result",
-          requestId: msg.requestId,
-          deleted,
-        });
+        send(conn, { op: "delete_prefix_result", requestId: msg.requestId, deleted });
         break;
       }
 
       case "snapshot": {
-        const keysOut: Record<string, unknown> = {};
-        const prefixesOut: Record<string, Record<string, unknown>> = {};
-
-        if (msg.keys) {
-          for (const k of msg.keys) {
-            if (k.startsWith(META)) continue;
-            keysOut[k] = await this.getWithTTLCheck(k, conn.id);
-          }
+        const result = await this.handleSnapshot(msg.keys, msg.prefixes, conn.id);
+        if ("error" in result) {
+          send(conn, { op: "error", requestId: msg.requestId, message: result.error });
+          break;
         }
-
-        if (msg.prefixes) {
-          for (const p of msg.prefixes) {
-            if (p !== "" && !p.endsWith("/")) {
-              send(conn, {
-                op: "error",
-                requestId: msg.requestId,
-                message: "Prefix must end with '/' or be empty string",
-              });
-              return;
-            }
-            prefixesOut[p] = await this.collectAllUserKeys(p);
-          }
-        }
-
         send(conn, {
           op: "snapshot_result",
           requestId: msg.requestId,
-          keys: keysOut,
-          prefixes: prefixesOut,
+          keys: result.keys,
+          prefixes: result.prefixes,
+          truncated: result.truncated,
         });
         break;
       }
 
+      case "transact": {
+        await this.handleTransact(msg, conn);
+        break;
+      }
+
       case "subscribe_key": {
-        const subs = this.subscriptions.get(conn.id);
-        if (!subs) break;
         if (msg.key.startsWith(META)) {
           send(conn, { op: "error", message: "Reserved key prefix" });
           break;
         }
-        subs.keys.set(msg.key, { includeSelf: msg.includeSelf === true });
+        state.subs.keys.set(msg.key, { includeSelf: msg.includeSelf === true, batchMs: msg.batchMs });
         break;
       }
 
       case "subscribe_prefix": {
-        const subs = this.subscriptions.get(conn.id);
-        if (!subs) break;
         if (msg.prefix !== "" && !msg.prefix.endsWith("/")) {
-          send(conn, {
-            op: "error",
-            message: "Prefix must end with '/' or be empty string",
-          });
+          send(conn, { op: "error", message: "Prefix must end with '/' or be empty string" });
           break;
         }
         if (msg.prefix.startsWith(META)) {
           send(conn, { op: "error", message: "Reserved key prefix" });
           break;
         }
-        subs.prefixes.set(msg.prefix, { includeSelf: msg.includeSelf === true });
+        state.subs.prefixes.set(msg.prefix, { includeSelf: msg.includeSelf === true, batchMs: msg.batchMs });
+        break;
+      }
+
+      case "subscribe_with_snapshot_key": {
+        if (msg.key.startsWith(META)) {
+          send(conn, { op: "error", requestId: msg.requestId, message: "Reserved key prefix" });
+          break;
+        }
+        state.subs.keys.set(msg.key, { includeSelf: msg.includeSelf === true, batchMs: msg.batchMs });
+        const value = await this.getWithTTLCheck(msg.key, conn.id);
+        const rev = await this.getRev(msg.key);
+        send(conn, {
+          op: "snapshot_initial",
+          requestId: msg.requestId,
+          kind: "key",
+          target: msg.key,
+          value,
+          rev,
+        });
+        break;
+      }
+
+      case "subscribe_with_snapshot_prefix": {
+        if (msg.prefix !== "" && !msg.prefix.endsWith("/")) {
+          send(conn, { op: "error", requestId: msg.requestId, message: "Prefix must end with '/' or be empty string" });
+          break;
+        }
+        if (msg.prefix.startsWith(META)) {
+          send(conn, { op: "error", requestId: msg.requestId, message: "Reserved key prefix" });
+          break;
+        }
+        state.subs.prefixes.set(msg.prefix, { includeSelf: msg.includeSelf === true, batchMs: msg.batchMs });
+        const entries = await this.collectAllUserKeys(msg.prefix);
+        send(conn, {
+          op: "snapshot_initial",
+          requestId: msg.requestId,
+          kind: "prefix",
+          target: msg.prefix,
+          entries: entries.entries,
+          truncated: entries.truncated,
+        });
         break;
       }
 
       case "unsubscribe_key": {
-        this.subscriptions.get(conn.id)?.keys.delete(msg.key);
+        state.subs.keys.delete(msg.key);
         break;
       }
 
       case "unsubscribe_prefix": {
-        this.subscriptions.get(conn.id)?.prefixes.delete(msg.prefix);
+        state.subs.prefixes.delete(msg.prefix);
         break;
       }
 
       case "broadcast": {
-        const broadcastMsg: ServerMsg = {
-          op: "broadcast_recv",
-          channel: msg.channel,
-          data: msg.data,
-        };
-        // Exclude sender — consistent with subscribe change fanout default.
+        const broadcastMsg: ServerMsg = { op: "broadcast_recv", channel: msg.channel, data: msg.data };
         this.party.broadcast(JSON.stringify(broadcastMsg), [conn.id]);
+        break;
+      }
+
+      case "register_schemas": {
+        if (msg.replace) this.schemas = { ...msg.schemas };
+        else             this.schemas = { ...this.schemas, ...msg.schemas };
+        const dos = this.party.storage as unknown as DurableObjectStorage;
+        await dos.put(META_SCHEMAS, this.schemas);
+        send(conn, {
+          op: "schemas_registered",
+          requestId: msg.requestId,
+          count: Object.keys(this.schemas).length,
+        });
         break;
       }
 
@@ -565,8 +733,8 @@ export default class RoomServer implements Party.Server {
           break;
         }
         const dos = this.party.storage as unknown as DurableObjectStorage;
-        await dos.put(`${META}alarm/fireAt`, Date.now() + msg.delay * 1000);
-        await dos.put(`${META}alarm/action`, msg.action ?? null);
+        await dos.put(META_ALARM_FIRE_AT, Date.now() + msg.delay * 1000);
+        await dos.put(META_ALARM_ACTION, msg.action ?? null);
         await this.rescheduleNextAlarm(dos);
         send(conn, { op: "ack", requestId: msg.requestId });
         break;
@@ -574,8 +742,8 @@ export default class RoomServer implements Party.Server {
 
       case "cancel_alarm": {
         const dos = this.party.storage as unknown as DurableObjectStorage;
-        await dos.delete(`${META}alarm/fireAt`);
-        await dos.delete(`${META}alarm/action`);
+        await dos.delete(META_ALARM_FIRE_AT);
+        await dos.delete(META_ALARM_ACTION);
         await this.rescheduleNextAlarm(dos);
         send(conn, { op: "ack", requestId: msg.requestId });
         break;
@@ -587,7 +755,7 @@ export default class RoomServer implements Party.Server {
           break;
         }
         const dos = this.party.storage as unknown as DurableObjectStorage;
-        await dos.put(`${META}alarm/recurring`, {
+        await dos.put(META_ALARM_RECURRING, {
           interval: msg.interval,
           action: msg.action,
           nextAt: Date.now() + msg.interval * 1000,
@@ -599,35 +767,223 @@ export default class RoomServer implements Party.Server {
 
       case "cancel_recurring": {
         const dos = this.party.storage as unknown as DurableObjectStorage;
-        await dos.delete(`${META}alarm/recurring`);
+        await dos.delete(META_ALARM_RECURRING);
         await this.rescheduleNextAlarm(dos);
         send(conn, { op: "ack", requestId: msg.requestId });
         break;
       }
 
       default: {
+        const _exhaustive: never = msg;
+        void _exhaustive;
         send(conn, { op: "error", message: "Unknown op" });
       }
     }
+  }
+
+  // ── Transact ────────────────────────────────────────────────────────────────
+
+  private async handleTransact(
+    msg: Extract<ClientMsg, { op: "transact" }>,
+    conn: Party.Connection
+  ) {
+    // Phase 1: validate ops + check preconditions before any write.
+    for (let i = 0; i < msg.ops.length; i++) {
+      const op = msg.ops[i]!;
+      if (op.key.startsWith(META) || op.key.startsWith("presence/")) {
+        send(conn, {
+          op: "transact_result",
+          requestId: msg.requestId,
+          success: false,
+          results: [],
+          error: `op ${i}: reserved key prefix`,
+        });
+        return;
+      }
+    }
+
+    // Phase 2: simulate each set_if precondition. Treat same-key writes within the
+    // batch as ordered: a later set_if's precondition reads the value written by
+    // an earlier op in the same transact.
+    const projected = new Map<string, { value: unknown; rev: number; deleted: boolean }>();
+    const readCurrent = async (key: string): Promise<{ value: unknown; rev: number }> => {
+      if (projected.has(key)) {
+        const p = projected.get(key)!;
+        return { value: p.deleted ? null : p.value, rev: p.rev };
+      }
+      const value = await this.getWithTTLCheck(key, null);
+      const rev = await this.getRev(key);
+      return { value, rev };
+    };
+
+    for (let i = 0; i < msg.ops.length; i++) {
+      const op = msg.ops[i]!;
+      if (op.op === "set_if") {
+        const cur = await readCurrent(op.key);
+        const ok = op.ifRev !== undefined
+          ? cur.rev === op.ifRev
+          : deepEqual(cur.value, op.ifValue);
+        if (!ok) {
+          send(conn, {
+            op: "transact_result",
+            requestId: msg.requestId,
+            success: false,
+            results: [],
+            error: `op ${i}: set_if precondition failed for "${op.key}"`,
+          });
+          return;
+        }
+      }
+      // Project this op's effect for subsequent precondition checks.
+      const cur = await readCurrent(op.key);
+      const nextRev = cur.rev + 1;
+      if (op.op === "set" || op.op === "set_if") {
+        projected.set(op.key, { value: op.value, rev: nextRev, deleted: false });
+      } else if (op.op === "delete") {
+        projected.set(op.key, { value: null, rev: nextRev, deleted: true });
+      } else if (op.op === "increment") {
+        const num = typeof cur.value === "number" ? cur.value : 0;
+        projected.set(op.key, { value: num + (op.delta ?? 1), rev: nextRev, deleted: false });
+      }
+    }
+
+    // Phase 3: validate all projected values against schemas before any write.
+    for (const [key, p] of projected) {
+      if (p.deleted) continue;
+      const errs = this.validateWrite(key, p.value);
+      if (errs) {
+        send(conn, {
+          op: "error",
+          requestId: msg.requestId,
+          message: `Validation failed for "${key}"`,
+          validationError: errs,
+        });
+        return;
+      }
+    }
+
+    // Phase 4: apply, in order. Each op produces one TransactOpResult and one notify.
+    const results: TransactOpResult[] = [];
+    const dos = this.party.storage as unknown as DurableObjectStorage;
+    const changes: ChangeMsg[] = [];
+
+    for (let i = 0; i < msg.ops.length; i++) {
+      const op = msg.ops[i]!;
+      switch (op.op) {
+        case "set": {
+          await this.store.set(op.key, op.value);
+          await this.clearTTL(op.key, true);
+          if (op.ttl) await this.scheduleTTL(op.key, op.ttl);
+          await this.bumpRev(op.key);
+          const rev = await this.getRev(op.key);
+          results.push({ op: "set", key: op.key, rev });
+          changes.push({ op: "change", type: "set", key: op.key, value: op.value, rev, originConnId: conn.id });
+          break;
+        }
+        case "delete": {
+          await this.store.delete(op.key);
+          await this.clearTTL(op.key, true);
+          await this.bumpRev(op.key);
+          const rev = await this.getRev(op.key);
+          results.push({ op: "delete", key: op.key, rev });
+          changes.push({ op: "change", type: "delete", key: op.key, rev, originConnId: conn.id });
+          break;
+        }
+        case "increment": {
+          const current = await this.getWithTTLCheck(op.key, null);
+          const num = typeof current === "number" ? current : 0;
+          const next = num + (op.delta ?? 1);
+          await this.store.set(op.key, next);
+          await this.bumpRev(op.key);
+          const rev = await this.getRev(op.key);
+          results.push({ op: "increment", key: op.key, rev, value: next });
+          changes.push({ op: "change", type: "set", key: op.key, value: next, rev, originConnId: conn.id });
+          break;
+        }
+        case "set_if": {
+          const current = await this.getWithTTLCheck(op.key, null);
+          await this.store.set(op.key, op.value);
+          await this.bumpRev(op.key);
+          const rev = await this.getRev(op.key);
+          results.push({ op: "set_if", key: op.key, success: true, current, rev });
+          changes.push({ op: "change", type: "set", key: op.key, value: op.value, rev, originConnId: conn.id });
+          break;
+        }
+      }
+    }
+
+    await this.rescheduleNextAlarm(dos);
+
+    send(conn, {
+      op: "transact_result",
+      requestId: msg.requestId,
+      success: true,
+      results,
+    });
+    for (const change of changes) await this.notify(change);
+  }
+
+  // ── Snapshot helper ─────────────────────────────────────────────────────────
+
+  private async handleSnapshot(
+    keys: string[] | undefined,
+    prefixes: string[] | undefined,
+    sourceConnId: string
+  ): Promise<
+    | { keys: Record<string, unknown>; prefixes: Record<string, Record<string, unknown>>; truncated?: boolean }
+    | { error: string }
+  > {
+    const keysOut: Record<string, unknown> = {};
+    const prefixesOut: Record<string, Record<string, unknown>> = {};
+    let truncated = false;
+
+    if (keys) {
+      for (const k of keys) {
+        if (k.startsWith(META)) continue;
+        keysOut[k] = await this.getWithTTLCheck(k, sourceConnId);
+      }
+    }
+
+    if (prefixes) {
+      for (const p of prefixes) {
+        if (p !== "" && !p.endsWith("/")) {
+          return { error: "Prefix must end with '/' or be empty string" };
+        }
+        const result = await this.collectAllUserKeys(p);
+        prefixesOut[p] = result.entries;
+        if (result.truncated) truncated = true;
+      }
+    }
+
+    if (truncated) return { keys: keysOut, prefixes: prefixesOut, truncated };
+    return { keys: keysOut, prefixes: prefixesOut };
   }
 
   // ── Alarm action executor ───────────────────────────────────────────────────
 
   private async executeAction(action: AlarmAction) {
     switch (action.op) {
-      case "set":
+      case "set": {
         await this.store.set(action.key, action.value);
-        this.notifySet(action.key, action.value, null);
+        await this.bumpRev(action.key);
+        const rev = await this.getRev(action.key);
+        await this.notify({ op: "change", type: "set", key: action.key, value: action.value, rev, originConnId: null });
         break;
-      case "delete":
+      }
+      case "delete": {
         await this.store.delete(action.key);
-        this.notifyDelete(action.key, null);
+        await this.bumpRev(action.key);
+        const rev = await this.getRev(action.key);
+        await this.notify({ op: "change", type: "delete", key: action.key, rev, originConnId: null });
         break;
+      }
       case "increment": {
         const current = await this.store.get(action.key);
         const next = (typeof current === "number" ? current : 0) + (action.delta ?? 1);
         await this.store.set(action.key, next);
-        this.notifySet(action.key, next, null);
+        await this.bumpRev(action.key);
+        const rev = await this.getRev(action.key);
+        await this.notify({ op: "change", type: "set", key: action.key, value: next, rev, originConnId: null });
         break;
       }
       case "broadcast":
@@ -640,29 +996,33 @@ export default class RoomServer implements Party.Server {
 
   // ── List helpers ────────────────────────────────────────────────────────────
 
-  // Fetches user-visible keys, skipping internal __rs/ entries.
-  // If a page is entirely internal keys, fetches the next page (up to 20 times)
-  // so callers always get either user data or a definitive empty result.
+  // User-visible list. Skips internal `__rs/` entries and entries whose TTL has
+  // already expired (lazy filter — the alarm sweep eventually deletes them).
+  // Returns `truncated: true` when our paging budget is exhausted.
   private async listUserKeys(
     prefix: string,
     limit?: number,
     cursor?: string
-  ): Promise<{ entries: Record<string, unknown>; nextCursor?: string }> {
+  ): Promise<{ entries: Record<string, unknown>; nextCursor?: string; truncated?: boolean }> {
     const entries: Record<string, unknown> = {};
     let nextCursor: string | undefined;
     let fetchCursor = cursor;
+    let truncated = false;
 
-    const META_SKIP =
-      META.slice(0, -1) + String.fromCharCode(META.charCodeAt(META.length - 1) + 1);
+    const META_SKIP = META.slice(0, -1) + String.fromCharCode(META.charCodeAt(META.length - 1) + 1);
+    const dos = this.party.storage as unknown as DurableObjectStorage;
+    const now = Date.now();
 
     for (let i = 0; i < 20; i++) {
       const page = await this.store.list(prefix, limit, fetchCursor);
       let pageHadUserKeys = false;
       for (const [k, v] of Object.entries(page.entries)) {
-        if (!k.startsWith(META)) {
-          entries[k] = v;
-          pageHadUserKeys = true;
-        }
+        if (k.startsWith(META)) continue;
+        // Filter expired keys.
+        const expiresAt = await dos.get<number>(`${META_TTL}${k}`);
+        if (expiresAt !== undefined && expiresAt <= now) continue;
+        entries[k] = v;
+        pageHadUserKeys = true;
       }
       nextCursor = page.nextCursor;
       const userCount = Object.keys(entries).length;
@@ -670,6 +1030,7 @@ export default class RoomServer implements Party.Server {
       fetchCursor = (!pageHadUserKeys && nextCursor.startsWith(META))
         ? META_SKIP
         : nextCursor;
+      if (i === 19 && nextCursor) truncated = true;
     }
 
     if (limit) {
@@ -681,35 +1042,57 @@ export default class RoomServer implements Party.Server {
       }
     }
 
-    return { entries, nextCursor };
+    return truncated ? { entries, nextCursor, truncated } : { entries, nextCursor };
   }
 
-  // Fetches every user-visible key under a prefix in a single call. Used by
-  // snapshot — bounded by a safety cap to prevent runaway memory use.
-  private async collectAllUserKeys(prefix: string): Promise<Record<string, unknown>> {
+  private async collectAllUserKeys(
+    prefix: string
+  ): Promise<{ entries: Record<string, unknown>; truncated?: boolean }> {
     const out: Record<string, unknown> = {};
     let cursor: string | undefined;
-    const HARD_CAP = 10_000;
+    let truncated = false;
 
     while (true) {
       const page = await this.listUserKeys(prefix, 128, cursor);
       Object.assign(out, page.entries);
       if (!page.nextCursor) break;
       cursor = page.nextCursor;
-      if (Object.keys(out).length >= HARD_CAP) break;
+      if (Object.keys(out).length >= LIST_HARD_CAP) {
+        truncated = true;
+        break;
+      }
     }
-    return out;
+    return truncated ? { entries: out, truncated } : { entries: out };
   }
 
-  // Walks every user-visible key under a prefix and deletes it. Returns the
-  // count. Reschedules the alarm once at the end rather than per-key.
-  private async deletePrefix(prefix: string, sourceConnId: string): Promise<number> {
-    const META_SKIP =
-      META.slice(0, -1) + String.fromCharCode(META.charCodeAt(META.length - 1) + 1);
-
+  private async countUserKeys(prefix: string): Promise<{ count: number; truncated?: boolean }> {
     let count = 0;
     let cursor: string | undefined;
-    let touchedAnyTTL = false;
+    const META_SKIP = META.slice(0, -1) + String.fromCharCode(META.charCodeAt(META.length - 1) + 1);
+    const dos = this.party.storage as unknown as DurableObjectStorage;
+    const now = Date.now();
+
+    while (true) {
+      const page = await this.store.list(prefix, 128, cursor);
+      let pageHadUserKeys = false;
+      for (const k of Object.keys(page.entries)) {
+        if (k.startsWith(META)) continue;
+        const expiresAt = await dos.get<number>(`${META_TTL}${k}`);
+        if (expiresAt !== undefined && expiresAt <= now) continue;
+        count++;
+        pageHadUserKeys = true;
+      }
+      if (!page.nextCursor) break;
+      cursor = (!pageHadUserKeys && page.nextCursor.startsWith(META)) ? META_SKIP : page.nextCursor;
+      if (count >= COUNT_HARD_CAP) return { count, truncated: true };
+    }
+    return { count };
+  }
+
+  private async deletePrefix(prefix: string, sourceConnId: string): Promise<number> {
+    const META_SKIP = META.slice(0, -1) + String.fromCharCode(META.charCodeAt(META.length - 1) + 1);
+    let count = 0;
+    let cursor: string | undefined;
     const dos = this.party.storage as unknown as DurableObjectStorage;
 
     while (true) {
@@ -722,22 +1105,22 @@ export default class RoomServer implements Party.Server {
         pageHadUserKeys = true;
         await this.store.delete(k);
         // Per-key TTL cleanup, reschedule once at the end.
-        const had = await dos.get(`${META}ttl/${k}`);
-        if (had !== undefined) {
-          await dos.delete(`${META}ttl/${k}`);
-          touchedAnyTTL = true;
+        const expiresAt = await dos.get<number>(`${META_TTL}${k}`);
+        if (expiresAt !== undefined) {
+          await dos.delete(`${META_TTL}${k}`);
+          await dos.delete(buildTTLIndexKey(expiresAt, k));
         }
-        this.notifyDelete(k, sourceConnId);
+        await this.bumpRev(k);
+        const rev = await this.getRev(k);
+        await this.notify({ op: "change", type: "delete", key: k, rev, originConnId: sourceConnId });
         count++;
       }
 
       if (!page.nextCursor) break;
-      cursor = (!pageHadUserKeys && page.nextCursor.startsWith(META))
-        ? META_SKIP
-        : page.nextCursor;
+      cursor = (!pageHadUserKeys && page.nextCursor.startsWith(META)) ? META_SKIP : page.nextCursor;
     }
 
-    if (touchedAnyTTL) await this.rescheduleNextAlarm(dos);
+    if (count > 0) await this.rescheduleNextAlarm(dos);
     return count;
   }
 
@@ -745,8 +1128,25 @@ export default class RoomServer implements Party.Server {
 
   private async scheduleTTL(key: string, ttl: number) {
     const dos = this.party.storage as unknown as DurableObjectStorage;
-    await dos.put(`${META}ttl/${key}`, Date.now() + ttl * 1000);
+    const expiresAt = Date.now() + ttl * 1000;
+    // Clear any existing index entry first.
+    const existing = await dos.get<number>(`${META_TTL}${key}`);
+    if (existing !== undefined) {
+      await dos.delete(buildTTLIndexKey(existing, key));
+    }
+    await dos.put(`${META_TTL}${key}`, expiresAt);
+    await dos.put(buildTTLIndexKey(expiresAt, key), key);
     await this.rescheduleNextAlarm(dos);
+  }
+
+  private async clearTTL(key: string, skipReschedule = false) {
+    const dos = this.party.storage as unknown as DurableObjectStorage;
+    const expiresAt = await dos.get<number>(`${META_TTL}${key}`);
+    if (expiresAt !== undefined) {
+      await dos.delete(`${META_TTL}${key}`);
+      await dos.delete(buildTTLIndexKey(expiresAt, key));
+      if (!skipReschedule) await this.rescheduleNextAlarm(dos);
+    }
   }
 
   private async rescheduleNextAlarm(dos: DurableObjectStorage) {
@@ -755,93 +1155,103 @@ export default class RoomServer implements Party.Server {
 
     const pick = (t: number) => { next = next === null ? t : Math.min(next, t); };
 
-    let ttlCursor: string | undefined;
-    do {
-      const ttlPage = await dos.list<number>({ prefix: `${META}ttl/`, startAfter: ttlCursor });
-      for (const [k, expiresAt] of ttlPage) {
-        if (expiresAt > now) pick(expiresAt);
-        ttlCursor = k;
-      }
-      if (ttlPage.size < 128) break;
-    } while (true);
+    // Cheapest "next TTL" lookup: list 1 entry from the sorted index.
+    const ttlPage = await dos.list<string>({ prefix: META_TTL_BY_EXPIRY, limit: 1 });
+    for (const [indexKey] of ttlPage) {
+      const expiresAt = parseExpiryFromIndexKey(indexKey);
+      if (expiresAt > now) pick(expiresAt);
+      else                 pick(now + 1); // overdue; fire immediately
+    }
 
-    const fireAt = await dos.get<number>(`${META}alarm/fireAt`);
+    const fireAt = await dos.get<number>(META_ALARM_FIRE_AT);
     if (fireAt) pick(Math.max(fireAt, now + 1));
 
-    const rec = await dos.get<{ nextAt?: number }>(`${META}alarm/recurring`);
+    const rec = await dos.get<{ nextAt?: number }>(META_ALARM_RECURRING);
     if (rec) pick(Math.max(rec.nextAt ?? 0, now + 1));
 
     if (next !== null) await dos.setAlarm(next);
     else await dos.deleteAlarm();
   }
 
-  private async clearTTL(key: string, skipReschedule = false) {
-    const dos = this.party.storage as unknown as DurableObjectStorage;
-    const had = await dos.get(`${META}ttl/${key}`);
-    if (had !== undefined) {
-      await dos.delete(`${META}ttl/${key}`);
-      if (!skipReschedule) await this.rescheduleNextAlarm(dos);
-    }
-  }
-
   private async getWithTTLCheck(key: string, sourceConnId: string | null): Promise<unknown> {
     const dos = this.party.storage as unknown as DurableObjectStorage;
-    const expiresAt = await dos.get<number>(`${META}ttl/${key}`);
+    const expiresAt = await dos.get<number>(`${META_TTL}${key}`);
     if (expiresAt !== undefined && expiresAt <= Date.now()) {
       await this.store.delete(key);
-      await dos.delete(`${META}ttl/${key}`);
-      this.notifyDelete(key, sourceConnId);
+      await dos.delete(`${META_TTL}${key}`);
+      await dos.delete(buildTTLIndexKey(expiresAt, key));
+      await this.bumpRev(key);
+      const rev = await this.getRev(key);
+      await this.notify({ op: "change", type: "delete", key, rev, originConnId: sourceConnId });
       return null;
     }
     return this.store.get(key);
   }
 
-  // ── Subscription fanout ─────────────────────────────────────────────────────
+  // ── Rev helpers ─────────────────────────────────────────────────────────────
 
-  private notifySet(key: string, value: unknown, originConnId: string | null) {
-    this.fanout(key, originConnId, {
-      op: "change",
-      type: "set",
-      key,
-      value,
-      originConnId,
-    });
+  private async getRev(key: string): Promise<number> {
+    const dos = this.party.storage as unknown as DurableObjectStorage;
+    return (await dos.get<number>(`${META_REV}${key}`)) ?? 0;
   }
 
-  private notifyDelete(key: string, originConnId: string | null) {
-    this.fanout(key, originConnId, {
-      op: "change",
-      type: "delete",
-      key,
-      originConnId,
-    });
+  private async bumpRev(key: string): Promise<number> {
+    const dos = this.party.storage as unknown as DurableObjectStorage;
+    const current = (await dos.get<number>(`${META_REV}${key}`)) ?? 0;
+    const next = current + 1;
+    await dos.put(`${META_REV}${key}`, next);
+    return next;
   }
 
-  // Walks all connections and dispatches `change` to those whose subscription
-  // matches `key`. A connection that originated the change only receives it if
-  // at least one matching sub has `includeSelf: true`.
-  private fanout(key: string, sourceConnId: string | null, msg: ServerMsg) {
-    let payload: string | null = null;
+  // ── Validation ──────────────────────────────────────────────────────────────
 
-    for (const [connId, subs] of this.subscriptions) {
-      const isSource = sourceConnId !== null && connId === sourceConnId;
+  // Returns the validation error structure, or null if the value passes (or no
+  // schema applies).
+  private validateWrite(
+    key: string,
+    value: unknown
+  ): { key: string; schemaPattern: string; errors: ValidationErrorDetail[] } | null {
+    if (Object.keys(this.schemas).length === 0) return null;
+    const match = resolveSchema(key, this.schemas);
+    if (!match) return null;
+    const errors = validate(value, match.schema);
+    if (errors.length === 0) return null;
+    return { key, schemaPattern: match.pattern, errors };
+  }
+
+  // ── Subscription fanout (with batching) ─────────────────────────────────────
+
+  private async notify(change: ChangeMsg) {
+    for (const [connId, state] of this.connections) {
+      if (!state.authenticated) continue;
+      const isSource = change.originConnId !== null && connId === change.originConnId;
 
       let matched = false;
       let includeSelf = false;
+      let minBatchMs: number | "immediate" = "immediate";
 
-      const exact = subs.keys.get(key);
+      // Walk subs once to determine: matched? includeSelf? minBatchMs?
+      const exact = state.subs.keys.get(change.key);
       if (exact) {
         matched = true;
         if (exact.includeSelf) includeSelf = true;
+        if (exact.batchMs === undefined) minBatchMs = "immediate";
+        else if (minBatchMs !== "immediate" && exact.batchMs < minBatchMs) minBatchMs = exact.batchMs;
+        else if (minBatchMs !== "immediate" && minBatchMs === Infinity) minBatchMs = exact.batchMs;
       }
-      if (!includeSelf) {
-        for (const [prefix, sub] of subs.prefixes) {
-          if (key.startsWith(prefix)) {
-            matched = true;
-            if (sub.includeSelf) {
-              includeSelf = true;
-              break;
-            }
+
+      for (const [prefix, sub] of state.subs.prefixes) {
+        if (!change.key.startsWith(prefix)) continue;
+        matched = true;
+        if (sub.includeSelf) includeSelf = true;
+        if (sub.batchMs === undefined) {
+          minBatchMs = "immediate";
+        } else if (minBatchMs !== "immediate") {
+          if (typeof minBatchMs === "number") {
+            if (sub.batchMs < minBatchMs) minBatchMs = sub.batchMs;
+          } else {
+            // minBatchMs === Infinity (no batched sub seen yet)
+            minBatchMs = sub.batchMs;
           }
         }
       }
@@ -849,9 +1259,38 @@ export default class RoomServer implements Party.Server {
       if (!matched) continue;
       if (isSource && !includeSelf) continue;
 
-      payload ??= JSON.stringify(msg);
-      this.party.getConnection(connId)?.send(payload);
+      if (minBatchMs === "immediate") {
+        const target = this.party.getConnection(connId);
+        if (target) target.send(JSON.stringify(change));
+      } else {
+        // Batched delivery for this connection bucket.
+        const batchMs = typeof minBatchMs === "number" ? minBatchMs : 0;
+        let bucket = state.batchBuckets.get(batchMs);
+        if (!bucket) {
+          bucket = { changes: [], timer: null };
+          state.batchBuckets.set(batchMs, bucket);
+        }
+        bucket.changes.push(change);
+        if (!bucket.timer) {
+          bucket.timer = setTimeout(() => {
+            this.flushBatchBucket(connId, batchMs);
+          }, batchMs);
+        }
+      }
     }
+  }
+
+  private flushBatchBucket(connId: string, batchMs: number) {
+    const state = this.connections.get(connId);
+    if (!state) return;
+    const bucket = state.batchBuckets.get(batchMs);
+    if (!bucket) return;
+    bucket.timer = null;
+    if (bucket.changes.length === 0) return;
+    const payload = JSON.stringify({ op: "change_batch", changes: bucket.changes });
+    bucket.changes = [];
+    const target = this.party.getConnection(connId);
+    if (target) target.send(payload);
   }
 
   // ── Rate limiting ───────────────────────────────────────────────────────────
@@ -864,10 +1303,7 @@ export default class RoomServer implements Party.Server {
     return this.rateCheck(this.httpRateLimits, apiKey);
   }
 
-  private rateCheck(
-    map: Map<string, RateBucket>,
-    key: string
-  ): RateCheckResult {
+  private rateCheck(map: Map<string, RateBucket>, key: string): RateCheckResult {
     const now = Date.now();
     const limit = this.rateLimitOps;
     const window = this.rateLimitWindowMs;
@@ -875,13 +1311,7 @@ export default class RoomServer implements Party.Server {
 
     if (!existing || now - existing.windowStart > window) {
       map.set(key, { count: 1, windowStart: now, warned: false });
-      return {
-        allowed: true,
-        limit,
-        window,
-        remaining: limit - 1,
-        resetAt: now + window,
-      };
+      return { allowed: true, limit, window, remaining: limit - 1, resetAt: now + window };
     }
 
     existing.count++;
@@ -894,37 +1324,22 @@ export default class RoomServer implements Party.Server {
     };
   }
 
-  // Push a one-time `rate_limit_warning` per window once usage crosses 80%.
-  private maybeWarnRateLimit(
-    conn: Party.Connection,
-    connId: string,
-    rate: RateCheckResult
-  ) {
+  private maybeWarnRateLimit(conn: Party.Connection, connId: string, rate: RateCheckResult) {
     const bucket = this.rateLimits.get(connId);
     if (!bucket || bucket.warned) return;
     if (rate.remaining / rate.limit > 0.2) return;
     bucket.warned = true;
-    send(conn, {
-      op: "rate_limit_warning",
-      remaining: rate.remaining,
-      resetAt: rate.resetAt,
-    });
+    send(conn, { op: "rate_limit_warning", remaining: rate.remaining, resetAt: rate.resetAt });
   }
 
-  // ── Auth ────────────────────────────────────────────────────────────────────
+  // ── Auth (apiKey allowlist) ─────────────────────────────────────────────────
 
-  private authenticate(
-    apiKey: string,
-    env: Env
-  ): { ok: true; appId: string } | { ok: false; reason: string } {
+  private authenticate(apiKey: string, env: Env): { ok: true; appId: string } | { ok: false; reason: string } {
     if (!apiKey) return { ok: false, reason: "Missing apiKey" };
-
     const allowed = env.ALLOWED_KEYS;
     if (!allowed) return { ok: true, appId: apiKey };
-
     const keys = allowed.split(",").map((k) => k.trim());
     if (!keys.includes(apiKey)) return { ok: false, reason: "Invalid apiKey" };
-
     return { ok: true, appId: apiKey };
   }
 
@@ -945,10 +1360,19 @@ export default class RoomServer implements Party.Server {
     this.persistence = persistence;
     this.store = createStore(persistence, dos);
     await this.store.hydrate();
-    await dos.put(`${META}persistence`, persistence);
-    await dos.put(`${META}appId`, appId);
-    await dos.put(`${META}roomId`, this.roomId);
+    await dos.put(META_PERSISTENCE, persistence);
+    await dos.put(META_APP_ID, appId);
+    await dos.put(META_ROOM_ID, this.roomId);
     this.ready = true;
+  }
+
+  private createAuthedConnState(): ConnState {
+    return {
+      authenticated: true,
+      authTimeout: null,
+      subs: { keys: new Map(), prefixes: new Map() },
+      batchBuckets: new Map(),
+    };
   }
 }
 
@@ -958,12 +1382,21 @@ function send(conn: Party.Connection, msg: ServerMsg) {
   conn.send(JSON.stringify(msg));
 }
 
-function emptyConnSubs(): ConnSubs {
-  return { keys: new Map(), prefixes: new Map() };
-}
-
 function toRateLimitInfo(r: RateCheckResult): RateLimitInfo {
   return { limit: r.limit, window: r.window, remaining: r.remaining, resetAt: r.resetAt };
+}
+
+// Pad expiresAt to a fixed-width zero-padded decimal so DO's lexicographic
+// list ordering matches numeric ordering. 16 digits covers up to year 5138.
+function buildTTLIndexKey(expiresAt: number, userKey: string): string {
+  return `${META_TTL_BY_EXPIRY}${String(expiresAt).padStart(16, "0")}-${userKey}`;
+}
+
+function parseExpiryFromIndexKey(indexKey: string): number {
+  const stripped = indexKey.slice(META_TTL_BY_EXPIRY.length);
+  const dash = stripped.indexOf("-");
+  if (dash === -1) return 0;
+  return parseInt(stripped.slice(0, dash), 10);
 }
 
 function deepEqual(a: unknown, b: unknown): boolean {
@@ -986,3 +1419,5 @@ function cors(res: Response): Response {
   h.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
   return new Response(res.body, { status: res.status, headers: h });
 }
+
+void ((): TransactOp[] => []); // keep TransactOp imported for tsc when only used in types
